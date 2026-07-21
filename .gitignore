@@ -1,0 +1,22 @@
+# BEGIN swamp managed section - DO NOT EDIT
+
+# Runtime data (not needed in version control)
+.swamp/
+
+# Local extension sources (developer-specific, not shared)
+.swamp-sources.yaml
+
+# Claude Code configuration (managed by swamp)
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+# END swamp managed section
+
+# --- site-specific, not part of the publishable extension ---
+# Model instances carry the controller host + admin username in plaintext.
+/models/
+# Vault definitions point at local paths (secrets themselves live in .swamp/).
+/vaults/
+# Desired reservation sets are a MAC/IP inventory of the home network.
+/desired-*.json

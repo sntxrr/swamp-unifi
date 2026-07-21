@@ -1,0 +1,269 @@
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import {
+  base32Decode,
+  computeDrift,
+  inPool,
+  ipToInt,
+  normalizeMac,
+  totpCode,
+} from "./unifi_dhcp_reservation.ts";
+
+/* ---------------- TOTP ---------------- */
+
+// RFC 6238 Appendix B reference vectors (SHA-1, secret "12345678901234567890").
+const RFC_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+Deno.test("totpCode matches RFC 6238 vector at T=59", async () => {
+  assertEquals(await totpCode(RFC_SECRET, 59_000, 30, 8), "94287082");
+});
+
+Deno.test("totpCode matches RFC 6238 vector at T=1111111109", async () => {
+  assertEquals(await totpCode(RFC_SECRET, 1_111_111_109_000, 30, 8), "07081804");
+});
+
+Deno.test("totpCode matches RFC 6238 vector at T=1234567890", async () => {
+  assertEquals(await totpCode(RFC_SECRET, 1_234_567_890_000, 30, 8), "89005924");
+});
+
+Deno.test("totpCode defaults to 6 digits and zero-pads", async () => {
+  const code = await totpCode(RFC_SECRET, 59_000);
+  assertEquals(code, "287082");
+  assertEquals(code.length, 6);
+});
+
+Deno.test("totpCode is stable within a 30s step and rolls at the boundary", async () => {
+  const a = await totpCode(RFC_SECRET, 30_000);
+  const b = await totpCode(RFC_SECRET, 59_999);
+  const c = await totpCode(RFC_SECRET, 60_000);
+  assertEquals(a, b);
+  assertEquals(a === c, false);
+});
+
+Deno.test("base32Decode handles padding, lowercase and whitespace", () => {
+  assertEquals(base32Decode("MZXW6==="), base32Decode("mzxw6"));
+  assertEquals(base32Decode("MZXW 6"), base32Decode("MZXW6"));
+});
+
+Deno.test("base32Decode rejects invalid input", () => {
+  assertThrows(() => base32Decode("MZXW1"), Error, "Invalid base32");
+  assertThrows(() => base32Decode(""), Error, "Empty base32");
+});
+
+/* ---------------- IP helpers ---------------- */
+
+Deno.test("ipToInt orders addresses correctly", () => {
+  assertEquals(ipToInt("0.0.0.0"), 0);
+  assertEquals(ipToInt("255.255.255.255"), 4294967295);
+  assertEquals(ipToInt("192.0.2.10") < ipToInt("192.0.2.132"), true);
+});
+
+Deno.test("ipToInt rejects malformed addresses", () => {
+  assertThrows(() => ipToInt("192.0.2"), Error);
+  assertThrows(() => ipToInt("192.0.2.999"), Error);
+  assertThrows(() => ipToInt("not-an-ip"), Error);
+});
+
+Deno.test("inPool is inclusive of both endpoints", () => {
+  assertEquals(inPool("192.0.2.23", "192.0.2.23", "192.0.2.235"), true);
+  assertEquals(
+    inPool("192.0.2.235", "192.0.2.23", "192.0.2.235"),
+    true,
+  );
+  assertEquals(inPool("192.0.2.22", "192.0.2.23", "192.0.2.235"), false);
+  assertEquals(
+    inPool("192.0.2.236", "192.0.2.23", "192.0.2.235"),
+    false,
+  );
+});
+
+Deno.test("inPool is false when the pool is unknown", () => {
+  assertEquals(inPool("192.0.2.50", undefined, undefined), false);
+});
+
+Deno.test("normalizeMac canonicalises separators and case", () => {
+  assertEquals(normalizeMac("02:00:5E:00:53:01"), "02:00:5e:00:53:01");
+  assertEquals(normalizeMac("02-00-5e-00-53-01"), "02:00:5e:00:53:01");
+  assertEquals(normalizeMac("02005e005301"), "02:00:5e:00:53:01");
+});
+
+/* ---------------- Drift ---------------- */
+
+const POOL = {
+  start: "192.0.2.23",
+  stop: "192.0.2.235",
+  label: "np 192.0.2.23-192.0.2.235",
+};
+const AT = "2026-07-21T00:00:00.000Z";
+
+Deno.test("computeDrift reports an in-sync set", () => {
+  const d = computeDrift(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201" }],
+    [{
+      mac: "02:00:5E:00:53:01",
+      fixed_ip: "192.0.2.201",
+      use_fixedip: true,
+    }],
+    POOL,
+    AT,
+  );
+  assertEquals(d.inSync, true);
+  assertEquals(d.missing.length, 0);
+  assertEquals(d.mismatched.length, 0);
+});
+
+Deno.test("computeDrift finds a reservation the controller lacks", () => {
+  const d = computeDrift(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "app-server" }],
+    [],
+    POOL,
+    AT,
+  );
+  assertEquals(d.inSync, false);
+  assertEquals(d.missing, [{
+    mac: "02:00:5e:00:53:01",
+    ip: "192.0.2.201",
+    name: "app-server",
+  }]);
+});
+
+Deno.test("computeDrift finds an address that moved", () => {
+  const d = computeDrift(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201" }],
+    [{
+      mac: "02:00:5e:00:53:01",
+      fixed_ip: "192.0.2.132",
+      use_fixedip: true,
+    }],
+    POOL,
+    AT,
+  );
+  assertEquals(d.inSync, false);
+  assertEquals(d.mismatched, [{
+    mac: "02:00:5e:00:53:01",
+    desired_ip: "192.0.2.201",
+    live_ip: "192.0.2.132",
+    name: undefined,
+  }]);
+});
+
+Deno.test("computeDrift ignores clients that are not pinned", () => {
+  const d = computeDrift(
+    [],
+    [
+      { mac: "aa:bb:cc:dd:ee:ff", use_fixedip: false },
+      { mac: "11:22:33:44:55:66" },
+    ],
+    POOL,
+    AT,
+  );
+  assertEquals(d.liveCount, 0);
+  assertEquals(d.unmanaged.length, 0);
+});
+
+Deno.test("computeDrift surfaces reservations absent from the desired set", () => {
+  const d = computeDrift(
+    [],
+    [{
+      mac: "02:00:5e:00:53:05",
+      fixed_ip: "192.0.2.235",
+      use_fixedip: true,
+      name: "workstation",
+    }],
+    POOL,
+    AT,
+  );
+  assertEquals(d.unmanaged, [{
+    mac: "02:00:5e:00:53:05",
+    fixed_ip: "192.0.2.235",
+    name: "workstation",
+  }]);
+  // Unmanaged entries are informational — they do not by themselves mean drift.
+  assertEquals(d.inSync, true);
+});
+
+Deno.test("computeDrift flags desired addresses inside the DHCP pool", () => {
+  const d = computeDrift(
+    [
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.132" }, // in pool
+      { mac: "02:00:5e:00:53:02", ip: "192.0.2.249" }, // above pool ceiling
+    ],
+    [],
+    POOL,
+    AT,
+  );
+  assertEquals(d.poolConflicts, [{
+    mac: "02:00:5e:00:53:01",
+    ip: "192.0.2.132",
+    pool: POOL.label,
+  }]);
+});
+
+Deno.test("computeDrift catches two MACs claiming one address", () => {
+  // The real .10 collision: a reservation pointing at an address another host
+  // already owns is silently refused by the controller.
+  const d = computeDrift(
+    [
+      { mac: "02:00:5e:00:53:03", ip: "192.0.2.10" },
+      { mac: "02:00:5e:00:53:04", ip: "192.0.2.10" },
+    ],
+    [],
+    POOL,
+    AT,
+  );
+  assertEquals(d.inSync, false);
+  assertEquals(d.duplicates, [{
+    ip: "192.0.2.10",
+    macs: ["02:00:5e:00:53:03", "02:00:5e:00:53:04"],
+  }]);
+});
+
+Deno.test("computeDrift catches one MAC claiming two addresses", () => {
+  // The mirror of the duplicate-IP case: a hand-edited desired set that lists
+  // the same host twice with different addresses. apply must refuse this rather
+  // than PUT twice and let the last write win.
+  const d = computeDrift(
+    [
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.201" },
+      { mac: "02:00:5E:00:53:01", ip: "192.0.2.202" },
+    ],
+    [],
+    POOL,
+    AT,
+  );
+  assertEquals(d.inSync, false);
+  assertEquals(d.conflictingMacs, [{
+    mac: "02:00:5e:00:53:01",
+    ips: ["192.0.2.201", "192.0.2.202"],
+  }]);
+});
+
+Deno.test("computeDrift does not flag one MAC listed twice with the same IP", () => {
+  const d = computeDrift(
+    [
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.201" },
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.201" },
+    ],
+    [{
+      mac: "02:00:5e:00:53:01",
+      fixed_ip: "192.0.2.201",
+      use_fixedip: true,
+    }],
+    POOL,
+    AT,
+  );
+  assertEquals(d.conflictingMacs.length, 0);
+});
+
+Deno.test("computeDrift matches MACs across separator styles", () => {
+  const d = computeDrift(
+    [{ mac: "02-00-5E-00-53-01", ip: "192.0.2.201" }],
+    [{
+      mac: "02005e005301",
+      fixed_ip: "192.0.2.201",
+      use_fixedip: true,
+    }],
+    POOL,
+    AT,
+  );
+  assertEquals(d.inSync, true);
+});
