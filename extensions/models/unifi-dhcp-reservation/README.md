@@ -73,11 +73,11 @@ swamp model create @sntxrr/unifi/dhcp_reservation home-udm
 # read-only
 swamp model @sntxrr/unifi/dhcp_reservation method run sync home-udm
 swamp model @sntxrr/unifi/dhcp_reservation method run drift home-udm \
-  --arguments-file desired.json
+  --input-file desired.json
 
 # reconcile — always dry-run first
 swamp model @sntxrr/unifi/dhcp_reservation method run apply home-udm \
-  --arguments-file desired.json --arguments '{"dryRun": true}'
+  --input-file desired-dryrun.json
 ```
 
 `desired.json`:
@@ -90,6 +90,10 @@ swamp model @sntxrr/unifi/dhcp_reservation method run apply home-udm \
   ]
 }
 ```
+
+`dryRun` is passed in the same input file — copy `desired.json` to
+`desired-dryrun.json` and add `"dryRun": true` at the top level alongside
+`"desired"`.
 
 MAC addresses are normalised, so `02:00:5E:00:53:01`, `02-00-5e-00-53-01` and
 `02005e005301` all match the same client.
