@@ -2,6 +2,7 @@ import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   base32Decode,
   computeDrift,
+  computeVerification,
   inPool,
   ipToInt,
   normalizeMac,
@@ -18,11 +19,17 @@ Deno.test("totpCode matches RFC 6238 vector at T=59", async () => {
 });
 
 Deno.test("totpCode matches RFC 6238 vector at T=1111111109", async () => {
-  assertEquals(await totpCode(RFC_SECRET, 1_111_111_109_000, 30, 8), "07081804");
+  assertEquals(
+    await totpCode(RFC_SECRET, 1_111_111_109_000, 30, 8),
+    "07081804",
+  );
 });
 
 Deno.test("totpCode matches RFC 6238 vector at T=1234567890", async () => {
-  assertEquals(await totpCode(RFC_SECRET, 1_234_567_890_000, 30, 8), "89005924");
+  assertEquals(
+    await totpCode(RFC_SECRET, 1_234_567_890_000, 30, 8),
+    "89005924",
+  );
 });
 
 Deno.test("totpCode defaults to 6 digits and zero-pads", async () => {
@@ -266,4 +273,150 @@ Deno.test("computeDrift matches MACs across separator styles", () => {
     AT,
   );
   assertEquals(d.inSync, true);
+});
+
+/* ---------------- computeVerification ---------------- */
+
+Deno.test("computeVerification confirms a host sitting at its desired address", () => {
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "app" }],
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201" }],
+    [],
+    AT,
+  );
+  assertEquals(v.confirmed.length, 1);
+  assertEquals(v.moved.length, 0);
+  assertEquals(v.offline.length, 0);
+  assertEquals(v.safeToApply, true);
+});
+
+Deno.test("computeVerification flags a host that has drifted since the audit", () => {
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "app" }],
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.55" }],
+    [],
+    AT,
+  );
+  assertEquals(v.moved, [{
+    mac: "02:00:5e:00:53:01",
+    desired_ip: "192.0.2.201",
+    actual_ip: "192.0.2.55",
+    name: "app",
+  }]);
+  assertEquals(v.confirmed.length, 0);
+});
+
+Deno.test("computeVerification reports an unseen host as offline, not confirmed", () => {
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "app" }],
+    [{ mac: "02:00:5e:00:53:99", ip: "192.0.2.10" }],
+    [],
+    AT,
+  );
+  assertEquals(v.offline.length, 1);
+  assertEquals(v.confirmed.length, 0);
+  assertEquals(v.moved.length, 0);
+});
+
+Deno.test("computeVerification catches a desired address held by another device", () => {
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "app" }],
+    [
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.55" },
+      { mac: "aa:bb:cc:dd:ee:ff", ip: "192.0.2.201", hostname: "someones-tv" },
+    ],
+    [],
+    AT,
+  );
+  assertEquals(v.occupied, [{
+    ip: "192.0.2.201",
+    desired_mac: "02:00:5e:00:53:01",
+    held_by_mac: "aa:bb:cc:dd:ee:ff",
+    held_by_hostname: "someones-tv",
+    name: "app",
+  }]);
+  assertEquals(v.safeToApply, false);
+});
+
+Deno.test("computeVerification does not flag a swap between two desired hosts", () => {
+  // During a renumber each host transiently sits on the other's target. Both
+  // are managed, so the set resolves itself and this is not a collision.
+  const v = computeVerification(
+    [
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "a" },
+      { mac: "02:00:5e:00:53:02", ip: "192.0.2.202", name: "b" },
+    ],
+    [
+      { mac: "02:00:5e:00:53:01", ip: "192.0.2.202" },
+      { mac: "02:00:5e:00:53:02", ip: "192.0.2.201" },
+    ],
+    [],
+    AT,
+  );
+  assertEquals(v.occupied.length, 0);
+  assertEquals(v.moved.length, 2);
+  assertEquals(v.safeToApply, true);
+});
+
+Deno.test("computeVerification ignores clients the controller reports without an address", () => {
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201" }],
+    [{ mac: "02:00:5e:00:53:01" }],
+    [],
+    AT,
+  );
+  assertEquals(v.offline.length, 1);
+});
+
+Deno.test("computeVerification matches MACs across separator styles", () => {
+  const v = computeVerification(
+    [{ mac: "02-00-5E-00-53-01", ip: "192.0.2.201" }],
+    [{ mac: "02005e005301", ip: "192.0.2.201" }],
+    [],
+    AT,
+  );
+  assertEquals(v.confirmed.length, 1);
+});
+
+Deno.test("computeVerification flags adopted UniFi hardware as unreservable", () => {
+  // The controller rejects a fixed-IP reservation for anything it manages as a
+  // device with api.err.FixedIpAlreadyUsedByDevice, so this has to be caught
+  // before apply rather than surfacing as a 400 per device.
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30", name: "ap-back" }],
+    [],
+    [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30", name: "ap-back" }],
+    AT,
+  );
+  assertEquals(v.adoptedDevices, [{
+    mac: "02:00:5e:00:53:07",
+    ip: "192.0.2.30",
+    name: "ap-back",
+  }]);
+  assertEquals(v.safeToApply, false);
+  // Still confirmed as present at the right address — it is reachable, just
+  // not reservable.
+  assertEquals(v.confirmed.length, 1);
+});
+
+Deno.test("computeVerification leaves a pure client set safe to apply", () => {
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", name: "app" }],
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201" }],
+    [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30" }],
+    AT,
+  );
+  assertEquals(v.adoptedDevices.length, 0);
+  assertEquals(v.safeToApply, true);
+});
+
+Deno.test("computeVerification resolves a device address without calling it occupied", () => {
+  // An AP holding the address it is supposed to hold is not a collision.
+  const v = computeVerification(
+    [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30", name: "ap-back" }],
+    [],
+    [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30" }],
+    AT,
+  );
+  assertEquals(v.occupied.length, 0);
 });

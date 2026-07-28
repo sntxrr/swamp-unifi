@@ -1,7 +1,7 @@
 manifestVersion: 1
 
 name: "@sntxrr/unifi-dhcp-reservation"
-version: "2026.07.21.2"
+version: "2026.07.28.1"
 description: "Declarative DHCP fixed-IP reservations on a local UniFi controller (UDM / UDM Pro / UDM SE). `sync` reads every reservation the controller holds; `drift` compares a desired set against it without writing, reporting missing, mismatched, unmanaged, duplicate and DHCP-pool-overlapping entries; `apply` reconciles the controller to the desired set and supports `dryRun`. Reservations live on the legacy Network API as `user` objects carrying `use_fixedip`/`fixed_ip`. Adds TOTP/MFA login support, which the upstream @mgreten/unifi auth flow lacks — UniFi SSO accounts with MFA reject password-only logins with MFA_AUTH_REQUIRED. Catches the failure mode where a reservation silently never takes effect because its address is already claimed by a statically-configured host."
 repository: "https://github.com/sntxrr/swamp-unifi"
 

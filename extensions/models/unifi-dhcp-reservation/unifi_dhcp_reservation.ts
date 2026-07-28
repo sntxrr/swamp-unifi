@@ -434,6 +434,68 @@ const NetworkConfSchema = z.object({
 });
 type NetworkConf = z.infer<typeof NetworkConfSchema>;
 
+// `/stat/sta` — clients the controller currently sees. Unlike `/rest/user`
+// (every client ever known), this carries the address a host is *actually*
+// using right now, which is what a reserve-in-place set has to be checked
+// against.
+const ActiveClientSchema = z.object({
+  mac: z.string(),
+  ip: z.string().optional(),
+  hostname: z.string().optional(),
+  name: z.string().optional(),
+  is_wired: z.boolean().optional(),
+});
+type ActiveClient = z.infer<typeof ActiveClientSchema>;
+
+const VerifySchema = z.object({
+  checkedAt: z.string(),
+  desiredCount: z.number(),
+  safeToApply: z.boolean().describe(
+    "True when no desired address is currently held by a different device.",
+  ),
+  confirmed: z.array(z.object({
+    mac: z.string(),
+    ip: z.string(),
+    name: z.string().optional(),
+  })).describe("Host is online at exactly the desired address."),
+  moved: z.array(z.object({
+    mac: z.string(),
+    desired_ip: z.string(),
+    actual_ip: z.string(),
+    name: z.string().optional(),
+  })).describe(
+    "Host is online at a different address than the desired set expects. " +
+      "For a reserve-in-place set this means the set is stale.",
+  ),
+  offline: z.array(z.object({
+    mac: z.string(),
+    ip: z.string(),
+    name: z.string().optional(),
+  })).describe(
+    "Desired MAC is not currently visible, so its address cannot be " +
+      "confirmed either way.",
+  ),
+  occupied: z.array(z.object({
+    ip: z.string(),
+    desired_mac: z.string(),
+    held_by_mac: z.string(),
+    held_by_hostname: z.string().optional(),
+    name: z.string().optional(),
+  })).describe(
+    "Desired address is currently in use by a different device — reserving " +
+      "it would collide.",
+  ),
+  adoptedDevices: z.array(z.object({
+    mac: z.string(),
+    ip: z.string(),
+    name: z.string().optional(),
+  })).describe(
+    "Desired MAC is adopted UniFi hardware. The controller refuses DHCP " +
+      "reservations for these with api.err.FixedIpAlreadyUsedByDevice — they " +
+      "must be pinned in device config instead.",
+  ),
+});
+
 const ReservationSchema = z.object({
   mac: z.string(),
   fixed_ip: z.string(),
@@ -599,6 +661,112 @@ export function computeDrift(
   };
 }
 
+/**
+ * Check a desired reservation set against where hosts actually are right now.
+ *
+ * `drift` compares desired against *reservations*; this compares desired
+ * against *live leases*. The difference matters for a reserve-in-place set
+ * built from an earlier audit: an unreserved host may have moved since, and
+ * the address the set wants to pin may meanwhile have been leased to something
+ * else. Pinning it then collides.
+ *
+ * A desired MAC that is offline lands in `offline` rather than being assumed
+ * correct — the controller only reports addresses for clients it can see, and
+ * silence is not confirmation.
+ *
+ * Pure and side-effect free, so the rules can be tested without a controller.
+ *
+ * Adopted UniFi hardware is a special case: the controller rejects a fixed-IP
+ * reservation for anything it manages as a *device* rather than a client, with
+ * `api.err.FixedIpAlreadyUsedByDevice`. Those entries are reported separately
+ * so the set can be corrected before `apply` runs into a 400 per device.
+ *
+ * @param desired The reservation set that should exist.
+ * @param active Client objects as returned by `/stat/sta`.
+ * @param devices Adopted hardware as returned by `/stat/device`.
+ * @param checkedAt Timestamp to stamp on the result.
+ * @returns The verification report.
+ */
+export function computeVerification(
+  desired: { mac: string; ip: string; name?: string }[],
+  active: ActiveClient[],
+  devices: ActiveClient[],
+  checkedAt: string,
+): z.infer<typeof VerifySchema> {
+  const norm = desired.map((d) => ({ ...d, mac: normalizeMac(d.mac) }));
+  const seen = [...active, ...devices]
+    .filter((c) => c.ip && c.ip.length > 0)
+    .map((c) => ({ ...c, mac: normalizeMac(c.mac) }));
+  const deviceMacs = new Set(devices.map((d) => normalizeMac(d.mac)));
+
+  const byMac = new Map(seen.map((c) => [c.mac, c]));
+  const byIp = new Map(seen.map((c) => [c.ip!, c]));
+  const desiredMacs = new Set(norm.map((d) => d.mac));
+
+  const confirmed: { mac: string; ip: string; name?: string }[] = [];
+  const moved: {
+    mac: string;
+    desired_ip: string;
+    actual_ip: string;
+    name?: string;
+  }[] = [];
+  const offline: { mac: string; ip: string; name?: string }[] = [];
+  const occupied: {
+    ip: string;
+    desired_mac: string;
+    held_by_mac: string;
+    held_by_hostname?: string;
+    name?: string;
+  }[] = [];
+
+  for (const d of norm) {
+    const live = byMac.get(d.mac);
+    if (!live) {
+      offline.push({ mac: d.mac, ip: d.ip, name: d.name });
+    } else if (live.ip === d.ip) {
+      confirmed.push({ mac: d.mac, ip: d.ip, name: d.name });
+    } else {
+      moved.push({
+        mac: d.mac,
+        desired_ip: d.ip,
+        actual_ip: live.ip!,
+        name: d.name,
+      });
+    }
+
+    // Is the address we want to pin already in use by something else? A host
+    // sitting at its own desired address is not a conflict; another device
+    // there is. Two desired entries colliding is `drift`'s `duplicates`.
+    const holder = byIp.get(d.ip);
+    if (holder && holder.mac !== d.mac && !desiredMacs.has(holder.mac)) {
+      occupied.push({
+        ip: d.ip,
+        desired_mac: d.mac,
+        held_by_mac: holder.mac,
+        held_by_hostname: holder.hostname ?? holder.name,
+        name: d.name,
+      });
+    }
+  }
+
+  const adoptedDevices = norm
+    .filter((d) => deviceMacs.has(d.mac))
+    .map((d) => ({ mac: d.mac, ip: d.ip, name: d.name }));
+
+  return {
+    checkedAt,
+    desiredCount: norm.length,
+    // Both of these make `apply` fail rather than merely be unwise, so
+    // "safe" has to mean "every write will be accepted".
+    safeToApply: occupied.length === 0 && adoptedDevices.length === 0,
+    confirmed,
+    moved,
+    offline,
+    occupied,
+    adoptedDevices,
+  };
+}
+
 /* ------------------------------------------------------------------ *
  * Model
  * ------------------------------------------------------------------ */
@@ -671,7 +839,7 @@ async function loadPool(
  */
 export const model = {
   type: "@sntxrr/unifi/dhcp_reservation",
-  version: "2026.07.21.2",
+  version: "2026.07.28.1",
   globalArguments: UnifiGlobalArgsSchema,
   resources: {
     reservation: {
@@ -684,6 +852,13 @@ export const model = {
       description:
         "Comparison of a desired reservation set against the controller.",
       schema: DriftSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    verification: {
+      description:
+        "Pre-flight of a desired reservation set against live DHCP leases.",
+      schema: VerifySchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
@@ -795,6 +970,111 @@ export const model = {
           // "latest" is reserved by swamp for internal use.
           const handle = await context.writeResource(
             "drift",
+            "current",
+            result,
+          );
+          return { dataHandles: [handle] };
+        } finally {
+          await client.cleanup();
+        }
+      },
+    },
+
+    verify: {
+      description:
+        "Pre-flight a desired reservation set against live DHCP leases: where " +
+        "each host actually is now, and whether any desired address is already " +
+        "held by a different device. Read-only.",
+      arguments: z.object({
+        desired: z.array(DesiredEntrySchema).describe(
+          "The reservation set that should exist.",
+        ),
+      }),
+      execute: async (
+        args: { desired: z.infer<typeof DesiredEntrySchema>[] },
+        context: Context,
+      ) => {
+        context.logger.info(
+          "Checking {n} desired reservations against live leases on {host}",
+          { n: args.desired.length, host: context.globalArgs.host },
+        );
+        const client = await login(context.globalArgs);
+        try {
+          // Adopted UniFi hardware (APs, switches) is not a "client" and never
+          // appears on /stat/sta. It is read separately rather than merged,
+          // because the controller also refuses to reserve it.
+          let skipped = 0;
+          const parseRows = (rows: unknown[]): ActiveClient[] => {
+            const out: ActiveClient[] = [];
+            for (const row of rows) {
+              const parsed = ActiveClientSchema.safeParse(row);
+              if (parsed.success) out.push(parsed.data);
+              else skipped++;
+            }
+            return out;
+          };
+
+          const active = parseRows(await list(client, "/stat/sta"));
+          const devices = parseRows(await list(client, "/stat/device"));
+          if (skipped > 0) {
+            context.logger.warn(
+              "Skipped {count} client records that did not match the expected shape",
+              { count: skipped },
+            );
+          }
+
+          const result = computeVerification(
+            args.desired,
+            active,
+            devices,
+            new Date().toISOString(),
+          );
+
+          context.logger.info(
+            "{online} of {total} desired hosts online: {ok} at the expected address, {moved} elsewhere",
+            {
+              online: result.confirmed.length + result.moved.length,
+              total: result.desiredCount,
+              ok: result.confirmed.length,
+              moved: result.moved.length,
+            },
+          );
+          for (const m of result.moved) {
+            context.logger.warn(
+              "{name} ({mac}) is at {actual}, desired set says {desired}",
+              {
+                name: m.name ?? "unnamed",
+                mac: m.mac,
+                actual: m.actual_ip,
+                desired: m.desired_ip,
+              },
+            );
+          }
+          for (const o of result.occupied) {
+            context.logger.warn(
+              "{ip} is currently held by {holder} — reserving it for {name} would collide",
+              {
+                ip: o.ip,
+                holder: o.held_by_hostname ?? o.held_by_mac,
+                name: o.name ?? o.desired_mac,
+              },
+            );
+          }
+          for (const a of result.adoptedDevices) {
+            context.logger.warn(
+              "{name} ({mac}) is adopted UniFi hardware — it cannot hold a DHCP reservation; pin it in device config instead",
+              { name: a.name ?? "unnamed", mac: a.mac },
+            );
+          }
+          if (result.offline.length > 0) {
+            context.logger.info(
+              "{n} desired hosts are not currently visible; their addresses could not be confirmed",
+              { n: result.offline.length },
+            );
+          }
+
+          const handle = await context.writeResource(
+            "verification",
             "current",
             result,
           );

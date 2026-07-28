@@ -22,8 +22,14 @@ reports the disagreements before they become outages.
 | Method | Writes? | Purpose |
 | --- | --- | --- |
 | `sync` | no | Store one resource per reservation the controller holds. |
-| `drift` | no | Compare a desired set against the controller. |
+| `drift` | no | Compare a desired set against the controller's reservations. |
+| `verify` | no | Compare a desired set against live DHCP leases. |
 | `apply` | **yes** | Reconcile the controller to the desired set. Supports `dryRun`. |
+
+`drift` and `verify` answer different questions. `drift` asks *what has the
+controller been told?*; `verify` asks *where are these hosts actually sitting
+right now?* A desired set can be perfectly consistent with the reservation
+table and still be wrong about reality.
 
 ### What `drift` reports
 
@@ -35,6 +41,28 @@ reports the disagreements before they become outages.
 - **duplicates** — one address claimed by more than one MAC
 
 `inSync` is true when `missing`, `mismatched` and `duplicates` are all empty.
+
+### What `verify` reports
+
+- **confirmed** — host is online at exactly the desired address
+- **moved** — host is online at a *different* address than the set expects
+- **offline** — MAC is not currently visible, so nothing can be confirmed
+- **occupied** — the desired address is currently held by a **different**
+  device, so reserving it would collide
+
+`safeToApply` is true when `occupied` is empty.
+
+This is the check to run before reserving hosts *in place* from an earlier
+audit. Unreserved hosts are precisely the ones that drift, so an address
+recorded days ago may since have been leased to something else — `moved` says
+the set is stale, `occupied` says applying it would take an address away from a
+live device.
+
+Two hosts swapping addresses is not reported as `occupied`: both are managed, so
+the set resolves itself. A MAC that is offline is reported as such rather than
+assumed correct — the controller only reports addresses for hosts it can see,
+and silence is not confirmation. Adopted UniFi hardware (APs, switches) is read
+from `/stat/device` as well as `/stat/sta`, since it is not a "client".
 
 ### The failure mode this exists to catch
 
@@ -73,6 +101,8 @@ swamp model create @sntxrr/unifi/dhcp_reservation home-udm
 # read-only
 swamp model @sntxrr/unifi/dhcp_reservation method run sync home-udm
 swamp model @sntxrr/unifi/dhcp_reservation method run drift home-udm \
+  --input-file desired.json
+swamp model @sntxrr/unifi/dhcp_reservation method run verify home-udm \
   --input-file desired.json
 
 # reconcile — always dry-run first

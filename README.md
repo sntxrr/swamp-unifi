@@ -13,11 +13,12 @@ data: read what the controller has, compare, then reconcile — so static
 addressing stops drifting silently across in-guest config, controller
 reservations, and device-local settings.
 
-| Method  | Writes? | What it does                                                     |
-| ------- | ------- | --------------------------------------------------------------- |
-| `sync`  | no      | One resource per reservation the controller holds               |
-| `drift` | no      | Compare a desired set: missing, mismatched, unmanaged, conflicts |
-| `apply` | **yes** | Reconcile to the desired set; supports `dryRun`                  |
+| Method   | Writes? | What it does                                                     |
+| -------- | ------- | ---------------------------------------------------------------- |
+| `sync`   | no      | One resource per reservation the controller holds                |
+| `drift`  | no      | Compare a desired set: missing, mismatched, unmanaged, conflicts |
+| `verify` | no      | Compare a desired set against live leases before writing         |
+| `apply`  | **yes** | Reconcile to the desired set; supports `dryRun`                   |
 
 Handles MFA-enabled accounts (derives an RFC 6238 TOTP code per run) and catches
 the failure mode where a reservation silently never takes effect because its
@@ -45,6 +46,10 @@ swamp model @sntxrr/unifi/dhcp_reservation method run sync home-udm
 
 # Compare a desired set without writing (read-only)
 swamp model @sntxrr/unifi/dhcp_reservation method run drift home-udm \
+  --input-file desired.json
+
+# Check the desired set against where hosts actually are (read-only)
+swamp model @sntxrr/unifi/dhcp_reservation method run verify home-udm \
   --input-file desired.json
 
 # Reconcile — always dry-run first
