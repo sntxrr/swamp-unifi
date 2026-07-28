@@ -22,9 +22,12 @@ reports the disagreements before they become outages.
 | Method | Writes? | Purpose |
 | --- | --- | --- |
 | `sync` | no | Store one resource per reservation the controller holds. |
+| `inventory` | no | Every host the controller knows, clients and adopted hardware. |
 | `drift` | no | Compare a desired set against the controller's reservations. |
 | `verify` | no | Compare a desired set against live DHCP leases. |
 | `apply` | **yes** | Reconcile the controller to the desired set. Supports `dryRun`. |
+| `set_pool` | **yes** | Change the DHCP range. Supports `dryRun`. |
+| `device_pin` | **yes** | Static address in device config for adopted hardware. Supports `dryRun`. |
 
 `drift` and `verify` answer different questions. `drift` asks *what has the
 controller been told?*; `verify` asks *where are these hosts actually sitting
@@ -77,6 +80,36 @@ hand out an address a static host already owns.
 desired set that assigns one address to multiple MACs, rather than letting the
 last write win.
 
+### Two mechanisms, not one
+
+Reservations only work for **clients**. Adopted UniFi hardware — APs, switches
+— is managed by the controller as a *device*, and a reservation for one is
+rejected with `api.err.FixedIpAlreadyUsedByDevice`. Those get `device_pin`,
+which writes `config_network` directly. `verify` reports them as
+`adoptedDevices` so a mixed desired set fails the pre-flight rather than
+producing a 400 per device mid-write.
+
+Adopted hardware also never appears on `/stat/sta`, only `/stat/device`, so
+anything reading just the client table reports every AP as offline.
+
+### What `set_pool` reports
+
+Narrowing a range moves nothing by itself — existing leases are kept until they
+expire. What matters is who is left holding an address the new range no longer
+covers:
+
+- **displaced** — held a lease from the *old* pool that the new one excludes.
+  Unreserved ones re-lease inside the new range at expiry; reserved ones keep
+  their address, since out-of-pool reservations are honoured.
+- **strandedReservations** — reservations still inside the shrunken range.
+
+An address that was already outside the old pool is deliberately **not**
+reported as displaced. It was never leased — it is static on the host, or an
+out-of-pool reservation — so the change is a no-op for it. Saying "will
+re-lease" there would be wrong: there is no lease to expire. The controller
+cannot distinguish a static address from a leased one (both just appear on
+`/stat/sta`), so old-pool membership is the only available proxy.
+
 ## Authentication
 
 | Account type | Configuration |
@@ -105,9 +138,35 @@ swamp model @sntxrr/unifi/dhcp_reservation method run drift home-udm \
 swamp model @sntxrr/unifi/dhcp_reservation method run verify home-udm \
   --input-file desired.json
 
+# what is sitting at an address, and what vendor is it?
+swamp model @sntxrr/unifi/dhcp_reservation method run inventory home-udm \
+  --arguments '{"ips": ["192.0.2.234"]}'
+
 # reconcile — always dry-run first
 swamp model @sntxrr/unifi/dhcp_reservation method run apply home-udm \
   --input-file desired-dryrun.json
+
+# narrow the DHCP range, rehearsing first
+swamp model @sntxrr/unifi/dhcp_reservation method run set_pool home-udm \
+  --arguments '{"start":"192.0.2.23","stop":"192.0.2.199","dryRun":true}'
+
+# pin adopted hardware, which cannot hold a reservation
+swamp model @sntxrr/unifi/dhcp_reservation method run device_pin home-udm \
+  --input-file fabric-dryrun.json
+```
+
+`fabric-dryrun.json`:
+
+```json
+{
+  "devices": [
+    { "mac": "02:00:5e:00:53:07", "ip": "192.0.2.12", "name": "ap-back" }
+  ],
+  "netmask": "255.255.255.0",
+  "gateway": "192.0.2.1",
+  "dns1": "192.0.2.7",
+  "dryRun": true
+}
 ```
 
 `desired.json`:

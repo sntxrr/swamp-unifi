@@ -13,16 +13,21 @@ data: read what the controller has, compare, then reconcile — so static
 addressing stops drifting silently across in-guest config, controller
 reservations, and device-local settings.
 
-| Method   | Writes? | What it does                                                     |
-| -------- | ------- | ---------------------------------------------------------------- |
-| `sync`   | no      | One resource per reservation the controller holds                |
-| `drift`  | no      | Compare a desired set: missing, mismatched, unmanaged, conflicts |
-| `verify` | no      | Compare a desired set against live leases before writing         |
-| `apply`  | **yes** | Reconcile to the desired set; supports `dryRun`                   |
+| Method       | Writes? | What it does                                                     |
+| ------------ | ------- | ---------------------------------------------------------------- |
+| `sync`       | no      | One resource per reservation the controller holds                |
+| `inventory`  | no      | Every host the controller knows, clients and adopted hardware    |
+| `drift`      | no      | Compare a desired set: missing, mismatched, unmanaged, conflicts |
+| `verify`     | no      | Compare a desired set against live leases before writing         |
+| `apply`      | **yes** | Reconcile to the desired set; supports `dryRun`                  |
+| `set_pool`   | **yes** | Change the DHCP range; supports `dryRun`                         |
+| `device_pin` | **yes** | Static device config for adopted APs/switches; supports `dryRun` |
 
 Handles MFA-enabled accounts (derives an RFC 6238 TOTP code per run) and catches
 the failure mode where a reservation silently never takes effect because its
-address is already claimed by a statically-configured host. Full usage,
+address is already claimed by a statically-configured host. Reservations apply
+to clients; adopted UniFi hardware is pinned through `device_pin` instead,
+since the controller rejects reservations for anything it manages as a device. Full usage,
 arguments, and setup are in the
 [extension README](./extensions/models/unifi-dhcp-reservation/README.md).
 

@@ -1,6 +1,8 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  analysePoolChange,
   base32Decode,
+  buildInventory,
   computeDrift,
   computeVerification,
   inPool,
@@ -419,4 +421,151 @@ Deno.test("computeVerification resolves a device address without calling it occu
     AT,
   );
   assertEquals(v.occupied.length, 0);
+});
+
+/* ---------------- analysePoolChange ---------------- */
+
+const OLD_POOL = { start: "192.0.2.23", stop: "192.0.2.235" };
+
+const entry = (
+  ip: string,
+  o: Partial<
+    { mac: string; reserved: boolean; is_device: boolean; label: string }
+  > = {},
+) => ({
+  mac: o.mac ?? `02:00:5e:00:00:${ip.split(".").pop()!.padStart(2, "0")}`,
+  ip,
+  label: o.label,
+  is_device: o.is_device ?? false,
+  reserved: o.reserved ?? false,
+  in_dhcp_pool: false,
+});
+
+Deno.test("analysePoolChange reports an unreserved lease above the new ceiling", () => {
+  const r = analysePoolChange(
+    [entry("192.0.2.204", { label: "sonos" })],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.displaced.length, 1);
+  assertEquals(r.displaced[0].reserved, false);
+});
+
+Deno.test("analysePoolChange marks a displaced but reserved host as safe", () => {
+  // Inside the old pool, outside the new one, but pinned — out-of-pool
+  // reservations are honoured, so it keeps its address.
+  const r = analysePoolChange(
+    [entry("192.0.2.220", { reserved: true, label: "udsliving" })],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.displaced.length, 1);
+  assertEquals(r.displaced[0].reserved, true);
+});
+
+Deno.test("analysePoolChange ignores a host that was never in the old pool", () => {
+  // .236 sits above the old ceiling of .235, so its address cannot have come
+  // from a lease — it is static on the host. Narrowing the pool is a no-op for
+  // it, and saying "will re-lease" would be wrong: there is no lease to expire.
+  const r = analysePoolChange(
+    [entry("192.0.2.236", { label: "kvm1" })],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.displaced.length, 0);
+});
+
+Deno.test("analysePoolChange ignores adopted hardware, which takes no lease", () => {
+  const r = analysePoolChange(
+    [entry("192.0.2.220", { is_device: true, label: "switch" })],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.displaced.length, 0);
+});
+
+Deno.test("analysePoolChange flags reservations left inside the new range", () => {
+  const r = analysePoolChange(
+    [entry("192.0.2.132", { reserved: true, label: "patchmon" })],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.strandedReservations.length, 1);
+  assertEquals(r.displaced.length, 0);
+});
+
+Deno.test("analysePoolChange leaves a host inside the new range alone", () => {
+  const r = analysePoolChange(
+    [entry("192.0.2.50")],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.displaced.length, 0);
+  assertEquals(r.strandedReservations.length, 0);
+});
+
+Deno.test("analysePoolChange skips hosts with no known address", () => {
+  const r = analysePoolChange(
+    [{
+      mac: "02:00:5e:00:00:01",
+      is_device: false,
+      reserved: false,
+      in_dhcp_pool: false,
+    }],
+    OLD_POOL,
+    "192.0.2.23",
+    "192.0.2.199",
+  );
+  assertEquals(r.displaced.length, 0);
+});
+
+/* ---------------- buildInventory ---------------- */
+
+Deno.test("buildInventory joins reservation, live and device views by MAC", () => {
+  const inv = buildInventory(
+    [{
+      mac: "02:00:5E:00:53:01",
+      name: "app",
+      use_fixedip: true,
+      fixed_ip: "192.0.2.201",
+    }],
+    [{ mac: "02:00:5e:00:53:01", ip: "192.0.2.201", oui: "Acme" }],
+    [],
+    { start: "192.0.2.23", stop: "192.0.2.199" },
+  );
+  assertEquals(inv.length, 1);
+  assertEquals(inv[0].reserved, true);
+  assertEquals(inv[0].oui, "Acme");
+  assertEquals(inv[0].is_device, false);
+  assertEquals(inv[0].in_dhcp_pool, false);
+});
+
+Deno.test("buildInventory marks adopted hardware and sorts by address", () => {
+  const inv = buildInventory(
+    [],
+    [{ mac: "02:00:5e:00:53:02", ip: "192.0.2.150" }],
+    [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30", model: "U6-Pro" }],
+    { start: "192.0.2.23", stop: "192.0.2.199" },
+  );
+  assertEquals(inv.map((e) => e.ip), ["192.0.2.30", "192.0.2.150"]);
+  assertEquals(inv[0].is_device, true);
+  assertEquals(inv[0].label, "U6-Pro");
+  assertEquals(inv[1].in_dhcp_pool, true);
+});
+
+Deno.test("buildInventory sorts hosts with no address last", () => {
+  const inv = buildInventory(
+    [{ mac: "02:00:5e:00:53:09" }],
+    [{ mac: "02:00:5e:00:53:02", ip: "192.0.2.150" }],
+    [],
+    {},
+  );
+  assertEquals(inv[0].ip, "192.0.2.150");
+  assertEquals(inv[1].ip, undefined);
 });

@@ -444,8 +444,35 @@ const ActiveClientSchema = z.object({
   hostname: z.string().optional(),
   name: z.string().optional(),
   is_wired: z.boolean().optional(),
+  oui: z.string().optional(),
+  model: z.string().optional(),
 });
 type ActiveClient = z.infer<typeof ActiveClientSchema>;
+
+const InventoryEntrySchema = z.object({
+  mac: z.string(),
+  ip: z.string().optional(),
+  label: z.string().optional().describe(
+    "Best available name: alias, then hostname, then device model.",
+  ),
+  oui: z.string().optional().describe("Vendor, as the controller reports it."),
+  is_wired: z.boolean().optional(),
+  is_device: z.boolean().describe(
+    "Adopted UniFi hardware rather than a client.",
+  ),
+  reserved: z.boolean().describe("Holds a fixed-IP reservation."),
+  fixed_ip: z.string().optional(),
+  in_dhcp_pool: z.boolean().describe(
+    "Current address falls inside the DHCP range.",
+  ),
+});
+
+const InventorySchema = z.object({
+  checkedAt: z.string(),
+  pool: z.string(),
+  total: z.number(),
+  entries: z.array(InventoryEntrySchema),
+});
 
 const VerifySchema = z.object({
   checkedAt: z.string(),
@@ -494,6 +521,42 @@ const VerifySchema = z.object({
       "reservations for these with api.err.FixedIpAlreadyUsedByDevice — they " +
       "must be pinned in device config instead.",
   ),
+});
+
+const PoolChangeSchema = z.object({
+  checkedAt: z.string(),
+  network: z.string().optional(),
+  from: z.string(),
+  to: z.string(),
+  applied: z.boolean().describe("False for a rehearsal."),
+  displaced: z.array(z.object({
+    mac: z.string(),
+    ip: z.string(),
+    label: z.string().optional(),
+    reserved: z.boolean(),
+  })).describe(
+    "Hosts holding a live lease that the new range no longer covers. " +
+      "Unreserved ones re-lease inside the new range when their lease expires; " +
+      "reserved ones keep their address, since out-of-pool reservations are " +
+      "honoured.",
+  ),
+  strandedReservations: z.array(z.object({
+    mac: z.string(),
+    ip: z.string(),
+    label: z.string().optional(),
+  })).describe(
+    "Reservations left inside the shrunken range — still valid, but they no " +
+      "longer sit in the band the plan intends.",
+  ),
+});
+
+const DevicePinSchema = z.object({
+  mac: z.string(),
+  ip: z.string(),
+  action: z.enum(["pinned", "unchanged", "failed"]),
+  from: z.string().optional(),
+  detail: z.string().optional(),
+  dryRun: z.boolean(),
 });
 
 const ReservationSchema = z.object({
@@ -767,6 +830,168 @@ export function computeVerification(
   };
 }
 
+/**
+ * Merge the controller's three views of a host into one row per MAC.
+ *
+ * The controller splits what is conceptually one inventory across `/rest/user`
+ * (every client it has ever known, plus reservations), `/stat/sta` (clients
+ * currently online, with vendor and live address) and `/stat/device` (adopted
+ * hardware, which appears in neither of the first two). Answering "what is
+ * sitting at this address?" means joining all three.
+ *
+ * @param users Rows from `/rest/user`.
+ * @param active Rows from `/stat/sta`.
+ * @param devices Rows from `/stat/device`.
+ * @param pool The controller's DHCP range.
+ * @returns One entry per known MAC, sorted by address.
+ */
+export function buildInventory(
+  users: UnifiUser[],
+  active: ActiveClient[],
+  devices: ActiveClient[],
+  pool: { start?: string; stop?: string },
+): z.infer<typeof InventoryEntrySchema>[] {
+  const byMac = new Map<string, z.infer<typeof InventoryEntrySchema>>();
+
+  const upsert = (
+    mac: string,
+    patch: Partial<z.infer<typeof InventoryEntrySchema>>,
+  ) => {
+    const key = normalizeMac(mac);
+    const prev = byMac.get(key) ?? {
+      mac: key,
+      is_device: false,
+      reserved: false,
+      in_dhcp_pool: false,
+    };
+    // Live data wins over remembered data: `/rest/user` keeps a `fixed_ip` for
+    // hosts that are not currently using it.
+    byMac.set(key, {
+      ...prev,
+      ...Object.fromEntries(
+        Object.entries(patch).filter(([, v]) => v !== undefined && v !== ""),
+      ),
+    });
+  };
+
+  for (const u of users) {
+    upsert(u.mac, {
+      label: u.name ?? u.hostname,
+      reserved: u.use_fixedip === true && !!u.fixed_ip,
+      fixed_ip: u.fixed_ip,
+    });
+  }
+  for (const c of active) {
+    upsert(c.mac, {
+      ip: c.ip,
+      label: c.name ?? c.hostname,
+      oui: c.oui,
+      is_wired: c.is_wired,
+    });
+  }
+  for (const d of devices) {
+    upsert(d.mac, {
+      ip: d.ip,
+      label: d.name ?? d.hostname ?? d.model,
+      oui: d.oui,
+      is_device: true,
+    });
+  }
+
+  return [...byMac.values()]
+    .map((e) => ({
+      ...e,
+      in_dhcp_pool: e.ip ? inPool(e.ip, pool.start, pool.stop) : false,
+    }))
+    .sort((a, b) => {
+      if (!a.ip) return 1;
+      if (!b.ip) return -1;
+      try {
+        return ipToInt(a.ip) - ipToInt(b.ip);
+      } catch {
+        return 0;
+      }
+    });
+}
+
+/**
+ * Work out what a change of DHCP range would disturb.
+ *
+ * Shrinking a pool does not move anything by itself — existing leases are kept
+ * until they expire. What matters is which hosts are left holding an address
+ * the pool no longer covers, and whether each of those is pinned. An
+ * unreserved host will re-lease somewhere inside the new range at expiry,
+ * which is fine for a phone and not fine for something another machine
+ * hardcodes.
+ *
+ * Reservations outside the pool are honoured by the controller, so a reserved
+ * host is reported as displaced but is not at risk.
+ *
+ * Only a host whose address came from the *old* pool can actually be moved by
+ * the change. An address above the old ceiling was never leased — it is either
+ * statically configured on the host or an out-of-pool reservation — so
+ * narrowing the range is a no-op for it. Reporting those as "will re-lease"
+ * would be actively misleading, since a static host has no lease to expire.
+ *
+ * The controller cannot tell a static address from a leased one; both simply
+ * appear on `/stat/sta`. Old-pool membership is the only available proxy, and
+ * it is the correct one here.
+ *
+ * @param entries Current inventory.
+ * @param oldPool The range in force today.
+ * @param newStart First address of the proposed range.
+ * @param newStop Last address of the proposed range.
+ * @returns Hosts that will re-lease, and reservations left inside the new range.
+ */
+export function analysePoolChange(
+  entries: z.infer<typeof InventoryEntrySchema>[],
+  oldPool: { start?: string; stop?: string },
+  newStart: string,
+  newStop: string,
+): {
+  displaced: {
+    mac: string;
+    ip: string;
+    label?: string;
+    reserved: boolean;
+  }[];
+  strandedReservations: { mac: string; ip: string; label?: string }[];
+} {
+  const displaced: {
+    mac: string;
+    ip: string;
+    label?: string;
+    reserved: boolean;
+  }[] = [];
+  const strandedReservations: {
+    mac: string;
+    ip: string;
+    label?: string;
+  }[] = [];
+
+  for (const e of entries) {
+    if (!e.ip) continue;
+    const insideNew = inPool(e.ip, newStart, newStop);
+    const insideOld = inPool(e.ip, oldPool.start, oldPool.stop);
+
+    // Adopted hardware takes no lease, and neither does anything that was
+    // already outside the pool.
+    if (!insideNew && insideOld && !e.is_device) {
+      displaced.push({
+        mac: e.mac,
+        ip: e.ip,
+        label: e.label,
+        reserved: e.reserved,
+      });
+    }
+    if (insideNew && e.reserved) {
+      strandedReservations.push({ mac: e.mac, ip: e.ip, label: e.label });
+    }
+  }
+
+  return { displaced, strandedReservations };
+}
+
 /* ------------------------------------------------------------------ *
  * Model
  * ------------------------------------------------------------------ */
@@ -813,7 +1038,16 @@ function parseUsers(
 
 async function loadPool(
   client: UnifiClient,
-): Promise<{ start?: string; stop?: string; label: string }> {
+): Promise<
+  {
+    start?: string;
+    stop?: string;
+    label: string;
+    id?: string;
+    name?: string;
+    subnet?: string;
+  }
+> {
   const networks = await list<NetworkConf>(client, "/rest/networkconf");
   const lan = networks
     .map((n) => NetworkConfSchema.safeParse(n))
@@ -824,6 +1058,9 @@ async function loadPool(
     start: lan.dhcpd_start,
     stop: lan.dhcpd_stop,
     label: `${lan.name ?? "lan"} ${lan.dhcpd_start}-${lan.dhcpd_stop}`,
+    id: lan._id,
+    name: lan.name,
+    subnet: lan.ip_subnet,
   };
 }
 
@@ -839,7 +1076,7 @@ async function loadPool(
  */
 export const model = {
   type: "@sntxrr/unifi/dhcp_reservation",
-  version: "2026.07.28.1",
+  version: "2026.07.28.2",
   globalArguments: UnifiGlobalArgsSchema,
   resources: {
     reservation: {
@@ -861,6 +1098,25 @@ export const model = {
       schema: VerifySchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
+    },
+    inventory: {
+      description:
+        "Every host the controller knows about, clients and adopted hardware.",
+      schema: InventorySchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
+    pool_change: {
+      description: "Outcome of changing the DHCP range, and what it displaces.",
+      schema: PoolChangeSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    device_pin_result: {
+      description: "Outcome of pinning one adopted device to a static address.",
+      schema: DevicePinSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
     },
     apply_result: {
       description: "Outcome of reconciling one reservation.",
@@ -980,6 +1236,89 @@ export const model = {
       },
     },
 
+    inventory: {
+      description:
+        "List every host the controller knows about — clients and adopted " +
+        "hardware — joined into one row per MAC with vendor, current address, " +
+        "and whether it is reserved. Read-only.",
+      arguments: z.object({
+        macs: z.array(z.string()).optional().describe(
+          "Only these MACs (any separator style).",
+        ),
+        ips: z.array(z.string()).optional().describe("Only these addresses."),
+        unreservedOnly: z.boolean().default(false).describe(
+          "Only hosts without a fixed-IP reservation.",
+        ),
+      }),
+      execute: async (
+        args: { macs?: string[]; ips?: string[]; unreservedOnly: boolean },
+        context: Context,
+      ) => {
+        const client = await login(context.globalArgs);
+        try {
+          const pool = await loadPool(client);
+          const users = parseUsers(
+            await list<UnifiUser>(client, "/rest/user"),
+            context.logger,
+          );
+          const active = await list<ActiveClient>(client, "/stat/sta");
+          const devices = await list<ActiveClient>(client, "/stat/device");
+
+          const parseLoose = (rows: unknown[]): ActiveClient[] =>
+            rows.flatMap((r) => {
+              const p = ActiveClientSchema.safeParse(r);
+              return p.success ? [p.data] : [];
+            });
+
+          let entries = buildInventory(
+            users,
+            parseLoose(active),
+            parseLoose(devices),
+            pool,
+          );
+
+          if (args.macs?.length) {
+            const want = new Set(args.macs.map(normalizeMac));
+            entries = entries.filter((e) => want.has(e.mac));
+          }
+          if (args.ips?.length) {
+            const want = new Set(args.ips);
+            entries = entries.filter((e) => e.ip && want.has(e.ip));
+          }
+          if (args.unreservedOnly) {
+            entries = entries.filter((e) => !e.reserved);
+          }
+
+          context.logger.info(
+            "{n} hosts (DHCP pool: {pool})",
+            { n: entries.length, pool: pool.label },
+          );
+          for (const e of entries) {
+            context.logger.info(
+              "  {ip}  {label}  {oui}{device}{reserved}",
+              {
+                ip: e.ip ?? "(offline)",
+                label: e.label ?? "(unnamed)",
+                oui: e.oui ?? "",
+                device: e.is_device ? " [device]" : "",
+                reserved: e.reserved ? " [reserved]" : "",
+              },
+            );
+          }
+
+          const handle = await context.writeResource("inventory", "current", {
+            checkedAt: new Date().toISOString(),
+            pool: pool.label,
+            total: entries.length,
+            entries,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await client.cleanup();
+        }
+      },
+    },
+
     verify: {
       description:
         "Pre-flight a desired reservation set against live DHCP leases: where " +
@@ -1079,6 +1418,230 @@ export const model = {
             result,
           );
           return { dataHandles: [handle] };
+        } finally {
+          await client.cleanup();
+        }
+      },
+    },
+
+    set_pool: {
+      description:
+        "Change the DHCP range of the LAN network. Reports which hosts hold a " +
+        "lease the new range no longer covers before touching anything. " +
+        "Supports dryRun. WRITES.",
+      arguments: z.object({
+        start: z.string().describe("First address of the new DHCP range."),
+        stop: z.string().describe("Last address of the new DHCP range."),
+        dryRun: z.boolean().default(false).describe(
+          "Report what the change would displace without writing.",
+        ),
+      }),
+      execute: async (
+        args: { start: string; stop: string; dryRun: boolean },
+        context: Context,
+      ) => {
+        // Reject a malformed or inverted range before it reaches the
+        // controller, which would otherwise accept it and break DHCP.
+        if (ipToInt(args.start) > ipToInt(args.stop)) {
+          throw new Error(
+            `DHCP range start ${args.start} is above stop ${args.stop}`,
+          );
+        }
+
+        const client = await login(context.globalArgs);
+        try {
+          const pool = await loadPool(client);
+          if (!pool.id) {
+            throw new Error(
+              "No DHCP-enabled LAN network found on the controller",
+            );
+          }
+
+          const users = parseUsers(
+            await list<UnifiUser>(client, "/rest/user"),
+            context.logger,
+          );
+          const parseLoose = (rows: unknown[]): ActiveClient[] =>
+            rows.flatMap((r) => {
+              const p = ActiveClientSchema.safeParse(r);
+              return p.success ? [p.data] : [];
+            });
+          const entries = buildInventory(
+            users,
+            parseLoose(await list(client, "/stat/sta")),
+            parseLoose(await list(client, "/stat/device")),
+            pool,
+          );
+
+          const { displaced, strandedReservations } = analysePoolChange(
+            entries,
+            pool,
+            args.start,
+            args.stop,
+          );
+
+          context.logger.info(
+            "DHCP range {from} -> {to} (dryRun={dry})",
+            {
+              from: `${pool.start}-${pool.stop}`,
+              to: `${args.start}-${args.stop}`,
+              dry: args.dryRun,
+            },
+          );
+          for (const d of displaced) {
+            if (d.reserved) {
+              context.logger.info(
+                "  {ip} {label} is outside the new range but reserved — keeps its address",
+                { ip: d.ip, label: d.label ?? d.mac },
+              );
+            } else {
+              context.logger.warn(
+                "  {ip} {label} holds an unreserved lease outside the new range — it will re-lease on expiry",
+                { ip: d.ip, label: d.label ?? d.mac },
+              );
+            }
+          }
+
+          if (!args.dryRun) {
+            await client.request(
+              networkPath(client.site, `/rest/networkconf/${pool.id}`),
+              "PUT",
+              { dhcpd_start: args.start, dhcpd_stop: args.stop },
+            );
+            context.logger.info("DHCP range updated");
+          }
+
+          const handle = await context.writeResource("pool_change", "current", {
+            checkedAt: new Date().toISOString(),
+            network: pool.name,
+            from: `${pool.start}-${pool.stop}`,
+            to: `${args.start}-${args.stop}`,
+            applied: !args.dryRun,
+            displaced,
+            strandedReservations,
+          });
+          return { dataHandles: [handle] };
+        } finally {
+          await client.cleanup();
+        }
+      },
+    },
+
+    device_pin: {
+      description:
+        "Set a static address in device config on adopted UniFi hardware " +
+        "(APs, switches). These cannot hold DHCP reservations — the controller " +
+        "rejects those with api.err.FixedIpAlreadyUsedByDevice. Supports " +
+        "dryRun. WRITES.",
+      arguments: z.object({
+        devices: z.array(z.object({
+          mac: z.string().describe("Device MAC (any separator style)."),
+          ip: z.string().describe("Static address to pin."),
+          name: z.string().optional(),
+        })).describe("The devices to pin."),
+        netmask: z.string().default("255.255.255.0"),
+        gateway: z.string().describe("Default gateway for the fabric."),
+        dns1: z.string().optional(),
+        dns2: z.string().optional(),
+        dryRun: z.boolean().default(false),
+      }),
+      execute: async (
+        args: {
+          devices: { mac: string; ip: string; name?: string }[];
+          netmask: string;
+          gateway: string;
+          dns1?: string;
+          dns2?: string;
+          dryRun: boolean;
+        },
+        context: Context,
+      ) => {
+        const client = await login(context.globalArgs);
+        try {
+          const rows = await list<Record<string, unknown>>(
+            client,
+            "/stat/device",
+          );
+          const byMac = new Map<string, Record<string, unknown>>();
+          for (const r of rows) {
+            const mac = typeof r.mac === "string" ? normalizeMac(r.mac) : "";
+            if (mac) byMac.set(mac, r);
+          }
+
+          const handles: unknown[] = [];
+          for (const d of args.devices) {
+            const mac = normalizeMac(d.mac);
+            const live = byMac.get(mac);
+            let action: z.infer<typeof DevicePinSchema>["action"];
+            let detail: string | undefined;
+            let from: string | undefined;
+
+            try {
+              if (!live) {
+                throw new Error(
+                  "not adopted by this controller (absent from /stat/device)",
+                );
+              }
+              const id = live._id;
+              if (typeof id !== "string") {
+                throw new Error("device has no _id");
+              }
+              const cfg = (live.config_network ?? {}) as Record<
+                string,
+                unknown
+              >;
+              from = typeof cfg.ip === "string" ? cfg.ip : undefined;
+
+              if (cfg.type === "static" && cfg.ip === d.ip) {
+                action = "unchanged";
+              } else {
+                if (!args.dryRun) {
+                  await client.request(
+                    networkPath(client.site, `/rest/device/${id}`),
+                    "PUT",
+                    {
+                      config_network: {
+                        type: "static",
+                        ip: d.ip,
+                        netmask: args.netmask,
+                        gateway: args.gateway,
+                        ...(args.dns1 ? { dns1: args.dns1 } : {}),
+                        ...(args.dns2 ? { dns2: args.dns2 } : {}),
+                      },
+                    },
+                  );
+                }
+                action = "pinned";
+                detail = `${cfg.type ?? "dhcp"} ${
+                  from ?? "(dynamic)"
+                } -> static ${d.ip}`;
+              }
+            } catch (err) {
+              action = "failed";
+              detail = err instanceof Error ? err.message : String(err);
+              context.logger.warn("Pinning {mac} failed: {detail}", {
+                mac,
+                detail,
+              });
+            }
+
+            handles.push(
+              await context.writeResource("device_pin_result", mac, {
+                mac,
+                ip: d.ip,
+                action,
+                from,
+                detail,
+                dryRun: args.dryRun,
+              }),
+            );
+          }
+
+          context.logger.info("{mode}: {n} devices processed", {
+            mode: args.dryRun ? "Dry run" : "Applied",
+            n: args.devices.length,
+          });
+          return { dataHandles: handles };
         } finally {
           await client.cleanup();
         }
