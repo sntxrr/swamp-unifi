@@ -1,0 +1,16 @@
+{
+  "@sntxrr/apprise-notify": {
+    "version": "2026.07.30.1",
+    "pulledAt": "2026-07-31T20:55:57.298Z",
+    "files": [
+      ".swamp/pulled-extensions/@sntxrr/apprise-notify/models/apprise_notify.ts",
+      ".swamp/bundles/06ed2985/apprise_notify.js",
+      ".swamp/pulled-extensions/@sntxrr/apprise-notify/files/LICENSE.md",
+      ".swamp/pulled-extensions/@sntxrr/apprise-notify/files/README.md",
+      ".swamp/pulled-extensions/@sntxrr/apprise-notify/manifest.yaml"
+    ],
+    "checksum": "dce8c8d0cbf79924d155cab3e63f77bad7c4cbf1d644cf600b1d3b276131c448",
+    "filesChecksum": "eed46da2ff0d309f84018f72f9e3e593d1415946593935e2a846937d6a29f513",
+    "serverUrl": "https://swamp-club.com"
+  }
+}

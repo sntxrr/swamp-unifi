@@ -20,3 +20,12 @@
 /vaults/
 # Desired reservation sets are a MAC/IP inventory of the home network.
 /desired-*.json
+# Same class of data, and the /desired-*.json glob does not catch them:
+# fabric-devices.json is the adopted-hardware MAC/IP set, and the rollback
+# inventory is a full dump of every host on the network -- MACs, hostnames and
+# vendor OUIs for ~110 devices, including personal ones. Both were tracked by
+# mistake and were removed from history on 2026-07-31 before this repo's first
+# push carrying them. They stay on disk: the drift-watch crons read them with
+# --input-file, exactly as they read desired-phase2.json.
+/fabric-devices.json
+/rollback-inventory-*.json

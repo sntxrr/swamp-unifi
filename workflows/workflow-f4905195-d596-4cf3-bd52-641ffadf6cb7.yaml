@@ -1,0 +1,118 @@
+id: f4905195-d596-4cf3-bd52-641ffadf6cb7
+name: unifi-device-drift-watch
+description: >-
+  Compare the static addressing on adopted UniFi hardware against
+  fabric-devices.json and raise an Apprise notification when it diverges.
+
+  Companion to unifi-drift-watch, which covers DHCP reservations and is blind to
+  this. Adopted devices cannot hold reservations at all -- the controller
+  rejects them with api.err.FixedIpAlreadyUsedByDevice -- so APs and switches
+  are addressed through device config instead, and nothing was watching it. A
+  switch was once found carrying a stale config_network.ip while actually
+  sitting at a different address, a latent collision with another host's
+  target, unnoticed precisely because no check covered this surface.
+
+  Read-only. Uses `device_drift`, not `device_pin --dryRun`: the latter reports
+  the same divergence but is a write method one flag away from mutating the
+  fabric, which is not something a scheduled job should be wired to.
+
+  No trigger, for the same reason as unifi-drift-watch: the desired set is an
+  array whose single source of truth is fabric-devices.json. Invoke from cron:
+
+    swamp workflow run unifi-device-drift-watch --repo-dir <repo> \
+      --input-file fabric-devices.json
+tags: {}
+inputs:
+  properties:
+    devices:
+      type: array
+      description: >-
+        Adopted devices that should hold static addresses. Supply with
+        `--input-file fabric-devices.json`; no default, so a run can never
+        silently compare against a stale inline copy.
+      items:
+        type: object
+    _comment:
+      type: array
+      description: >-
+        Ignored. Exists only so `--input-file fabric-devices.json` can be passed
+        verbatim -- that file carries an explanatory `_comment` block, and swamp
+        rejects unknown inputs outright. Declared here rather than in the
+        model's argument schema to keep the published extension's API clean.
+      items:
+        type: string
+    notify:
+      type: boolean
+      description: >-
+        When false, detect drift but stay silent. For a manual run when you
+        already know the fabric is out of sync.
+      default: true
+  required:
+    - devices
+jobs:
+  - name: compare
+    description: Compare desired device pins against the controller
+    steps:
+      - name: detect-device-drift
+        description: >-
+          Report mismatched, unpinned (back on DHCP), unadopted and undeclared
+          devices. Reads /stat/device config_network; never writes.
+        task:
+          type: model_method
+          modelIdOrName: home-udm
+          methodName: device_drift
+          inputs:
+            # Only `devices` is forwarded -- `_comment` is absorbed above.
+            devices: ${{ inputs.devices }}
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: alert
+    description: Notify when the fabric diverges from the desired pins
+    steps:
+      - name: notify-device-drift
+        description: >-
+          Gated by the model's own `when` argument, since swamp step conditions
+          are status-based and cannot express a predicate over step output.
+
+          Includes `undeclared` in the gate. `inSync` covers mismatched,
+          unpinned and unadopted devices but treats a device pinned static
+          without being declared as informational -- and a static pin nobody
+          asked for is exactly the kind of quiet change worth catching.
+        task:
+          type: model_method
+          modelIdOrName: apprise
+          methodName: notify
+          inputs:
+            title: 'UniFi device pin drift'
+            # Data name is `device_drift` -- spec and instance are the same word
+            # in the extension precisely so this reference stays unambiguous no
+            # matter what else writes in the same run.
+            body: >-
+              ${{ "desired=" + string(data.latest('home-udm', 'device_drift').attributes.desiredCount)
+              + " adopted=" + string(data.latest('home-udm', 'device_drift').attributes.adoptedCount)
+              + " mismatched=" + string(size(data.latest('home-udm', 'device_drift').attributes.mismatched))
+              + " unpinned=" + string(size(data.latest('home-udm', 'device_drift').attributes.dynamic))
+              + " unadopted=" + string(size(data.latest('home-udm', 'device_drift').attributes.unadopted))
+              + " undeclared=" + string(size(data.latest('home-udm', 'device_drift').attributes.undeclared)) }}
+            type: warning
+            format: markdown
+            when: >-
+              ${{ inputs.notify &&
+              (data.latest('home-udm', 'device_drift').attributes.inSync == false ||
+              size(data.latest('home-udm', 'device_drift').attributes.undeclared) > 0) }}
+        dependsOn: []
+        weight: 0
+        # Non-fatal so a dead notifier cannot fail an otherwise good check --
+        # but note this is exactly what let a malformed CEL expression pass as a
+        # green run once. The cron wrapper greps for a failed notify step rather
+        # than trusting run status.
+        allowFailure: true
+    dependsOn:
+      - job: compare
+        condition:
+          type: succeeded
+    weight: 1
+version: 1

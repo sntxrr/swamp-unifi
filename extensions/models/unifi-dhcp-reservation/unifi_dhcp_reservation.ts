@@ -1076,7 +1076,7 @@ async function loadPool(
  */
 export const model = {
   type: "@sntxrr/unifi/dhcp_reservation",
-  version: "2026.07.28.2",
+  version: "2026.07.31.1",
   globalArguments: UnifiGlobalArgsSchema,
   resources: {
     reservation: {

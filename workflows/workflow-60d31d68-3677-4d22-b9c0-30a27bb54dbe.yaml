@@ -1,0 +1,140 @@
+id: 60d31d68-3677-4d22-b9c0-30a27bb54dbe
+name: unifi-drift-watch
+description: >-
+  Compare the controller's DHCP reservations against the desired set, raise an
+  Apprise notification when they diverge, and record a full host inventory.
+
+  Static addressing drifts silently across three places at once -- in-guest
+  config, controller reservations, and device-local settings -- and nothing
+  announces it. This is what makes the controller half of that noticed without
+  being asked.
+
+  Read-only. Every method used here (drift, inventory) is non-writing; the
+  reconciling methods (apply, set_pool, device_pin) are deliberately NOT wired
+  in, so this can report a problem but never "fix" one behind your back.
+
+  NOTE: deliberately has NO trigger. The `drift` method takes the desired set as
+  an inline array rather than a file path, and the only place that array should
+  live is desired-phase2.json. Baking 23 entries into a trigger block would fork
+  the source of truth. Invoke from cron with:
+
+    swamp workflow run unifi-drift-watch --repo-dir <repo> \
+      --input-file desired-phase2.json
+tags: {}
+inputs:
+  properties:
+    desired:
+      type: array
+      description: >-
+        The reservation set that should exist. Supply with
+        `--input-file desired-phase2.json` -- there is no default on purpose, so
+        a run can never silently compare against a stale inline copy.
+      items:
+        type: object
+    notify:
+      type: boolean
+      description: >-
+        When false, detect drift but stay silent. For a manual run when you
+        already know the controller is out of sync.
+      default: true
+  required:
+    - desired
+jobs:
+  - name: compare
+    description: Compare the desired reservation set against the controller
+    steps:
+      - name: detect-drift
+        description: Report missing, mismatched, unmanaged, conflicting entries
+        task:
+          type: model_method
+          modelIdOrName: home-udm
+          methodName: drift
+          inputs:
+            desired: ${{ inputs.desired }}
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: alert
+    description: Notify when the controller diverges from the desired set
+    steps:
+      - name: notify-drift
+        description: >-
+          Gated by the model's own `when` argument rather than a step
+          condition, because swamp step conditions are status-based and cannot
+          express a predicate over step output.
+
+          The gate is broader than `inSync` alone. `inSync` covers missing,
+          mismatched, duplicate and pool-conflicting entries but treats
+          `unmanaged` -- a reservation on the controller that nobody asked for
+          -- as informational. Since desired-phase2.json now describes all 23
+          reservations that should exist, any unmanaged entry is by definition
+          something that appeared without being declared, which is exactly the
+          case worth waking up for.
+        task:
+          type: model_method
+          modelIdOrName: apprise
+          methodName: notify
+          inputs:
+            title: 'UniFi reservation drift'
+            # The data name is "current", NOT "drift" -- "drift" is the resource
+            # spec, and data.latest() takes the instance name.
+            body: >-
+              ${{ "desired=" + string(data.latest('home-udm', 'current').attributes.desiredCount)
+              + " live=" + string(data.latest('home-udm', 'current').attributes.liveCount)
+              + " missing=" + string(size(data.latest('home-udm', 'current').attributes.missing))
+              + " mismatched=" + string(size(data.latest('home-udm', 'current').attributes.mismatched))
+              + " unmanaged=" + string(size(data.latest('home-udm', 'current').attributes.unmanaged))
+              + " poolConflicts=" + string(size(data.latest('home-udm', 'current').attributes.poolConflicts))
+              + " duplicates=" + string(size(data.latest('home-udm', 'current').attributes.duplicates)) }}
+            type: warning
+            format: markdown
+            when: >-
+              ${{ inputs.notify &&
+              (data.latest('home-udm', 'current').attributes.inSync == false ||
+              size(data.latest('home-udm', 'current').attributes.unmanaged) > 0) }}
+        dependsOn: []
+        weight: 0
+        # An undeliverable notification must not turn a successful drift check
+        # into a failed run -- the drift result is already durable in the data
+        # store. Matches the homelab convention that notify failures are
+        # non-fatal, and mirrors acl-drift-watch.
+        #
+        # Caveat this cuts both ways: it is why a broken CEL expression here
+        # showed up as a green run. If you edit the expressions above, check
+        # `swamp workflow history get unifi-drift-watch` for a failed
+        # notify-drift step rather than trusting the run status.
+        allowFailure: true
+    dependsOn:
+      - job: compare
+        condition:
+          type: succeeded
+    weight: 1
+  - name: snapshot
+    description: Record every host the controller currently knows
+    steps:
+      - name: take-inventory
+        description: >-
+          Full host list, clients and adopted hardware -- a dated record of what
+          was on the network, which is what you want when working out *when*
+          something changed.
+        task:
+          type: model_method
+          modelIdOrName: home-udm
+          methodName: inventory
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    # Runs LAST, and that is load-bearing. `inventory` and `drift` both write
+    # their result under the data name "current" (the extension does not
+    # namespace instance names by resource spec), so whichever runs later wins
+    # data.latest('home-udm', 'current'). Ordering inventory after the alert is
+    # what guarantees the gate above reads a drift report and not a host list.
+    # Do not reorder these jobs without changing how the alert reads its data.
+    dependsOn:
+      - job: alert
+        condition:
+          type: completed
+    weight: 2
+version: 1

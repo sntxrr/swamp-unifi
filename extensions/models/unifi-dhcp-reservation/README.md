@@ -27,6 +27,7 @@ reports the disagreements before they become outages.
 | `verify` | no | Compare a desired set against live DHCP leases. |
 | `apply` | **yes** | Reconcile the controller to the desired set. Supports `dryRun`. |
 | `set_pool` | **yes** | Change the DHCP range. Supports `dryRun`. |
+| `device_drift` | no | Compare desired static pins against adopted hardware. |
 | `device_pin` | **yes** | Static address in device config for adopted hardware. Supports `dryRun`. |
 
 `drift` and `verify` answer different questions. `drift` asks *what has the
@@ -91,6 +92,29 @@ producing a 400 per device mid-write.
 
 Adopted hardware also never appears on `/stat/sta`, only `/stat/device`, so
 anything reading just the client table reports every AP as offline.
+
+### What `device_drift` reports
+
+The read-only counterpart to `device_pin`, and the only method that covers
+adopted hardware. `drift` compares reservations, which devices cannot hold, so
+without this the fabric is unwatched.
+
+- **mismatched** — pinned static, but to a different address than desired
+- **dynamic** — adopted but not pinned at all, so the address is not guaranteed
+- **unadopted** — desired, but absent from `/stat/device`
+- **undeclared** — pinned static but absent from the desired set
+  (informational; does not by itself count as drift, matching `unmanaged`)
+
+`inSync` is true when `mismatched`, `dynamic` and `unadopted` are all empty.
+
+Devices left on DHCP but not in the desired set are deliberately **not**
+reported as `undeclared` — nothing was pinned, so nothing can have drifted. The
+gateway itself is the usual example: it appears on `/stat/device` and would
+otherwise raise a finding on every run.
+
+`device_pin --dryRun` reports much the same divergence, but it is a write method
+one flag away from mutating the fabric and emits one resource per MAC with no
+aggregate verdict. Prefer `device_drift` for anything scheduled.
 
 ### What `set_pool` reports
 
@@ -160,7 +184,7 @@ swamp model @sntxrr/unifi/dhcp_reservation method run device_pin home-udm \
 ```json
 {
   "devices": [
-    { "mac": "02:00:5e:00:53:07", "ip": "192.0.2.12", "name": "ap-back" }
+    { "mac": "02:00:5e:00:53:03", "ip": "192.0.2.12", "name": "ap-back" }
   ],
   "netmask": "255.255.255.0",
   "gateway": "192.0.2.1",
