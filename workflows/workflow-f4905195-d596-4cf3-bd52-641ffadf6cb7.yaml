@@ -1,10 +1,10 @@
 id: f4905195-d596-4cf3-bd52-641ffadf6cb7
-name: unifi-device-drift-watch
+name: "@sntxrr/unifi-device-drift-watch"
 description: >-
   Compare the static addressing on adopted UniFi hardware against
   fabric-devices.json and raise an Apprise notification when it diverges.
 
-  Companion to unifi-drift-watch, which covers DHCP reservations and is blind to
+  Companion to @sntxrr/unifi-drift-watch, which covers DHCP reservations and is blind to
   this. Adopted devices cannot hold reservations at all -- the controller
   rejects them with api.err.FixedIpAlreadyUsedByDevice -- so APs and switches
   are addressed through device config instead, and nothing was watching it. A
@@ -16,10 +16,10 @@ description: >-
   the same divergence but is a write method one flag away from mutating the
   fabric, which is not something a scheduled job should be wired to.
 
-  No trigger, for the same reason as unifi-drift-watch: the desired set is an
+  No trigger, for the same reason as @sntxrr/unifi-drift-watch: the desired set is an
   array whose single source of truth is fabric-devices.json. Invoke from cron:
 
-    swamp workflow run unifi-device-drift-watch --repo-dir <repo> \
+    swamp workflow run @sntxrr/unifi-device-drift-watch --repo-dir <repo> \
       --input-file fabric-devices.json
 tags: {}
 inputs:
@@ -83,7 +83,7 @@ jobs:
           That is true of `dependsOn` conditions, which are status-based, but
           not of `guard`. The gate belongs to the decision rather than to the
           transport, so it now reads the same whatever notifier this points at.
-          See the matching note in unifi-drift-watch.
+          See the matching note in @sntxrr/unifi-drift-watch.
 
           Behaviour change worth knowing: `when` invoked the notifier and let
           it decline, leaving an apprise record with skipped=true every hour.

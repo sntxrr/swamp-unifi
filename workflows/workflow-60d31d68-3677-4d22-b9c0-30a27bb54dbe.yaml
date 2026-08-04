@@ -1,5 +1,5 @@
 id: 60d31d68-3677-4d22-b9c0-30a27bb54dbe
-name: unifi-drift-watch
+name: "@sntxrr/unifi-drift-watch"
 description: >-
   Compare the controller's DHCP reservations against the desired set, raise an
   Apprise notification when they diverge, and record a full host inventory.
@@ -18,7 +18,7 @@ description: >-
   live is desired-phase2.json. Baking 23 entries into a trigger block would fork
   the source of truth. Invoke from cron with:
 
-    swamp workflow run unifi-drift-watch --repo-dir <repo> \
+    swamp workflow run @sntxrr/unifi-drift-watch --repo-dir <repo> \
       --input-file desired-phase2.json
 tags: {}
 inputs:
@@ -88,24 +88,26 @@ jobs:
           only when it is in sync AND nothing unmanaged turned up.
         guard: >-
           ${{ !inputs.notify ||
-          (data.latest('home-udm', 'current').attributes.inSync &&
-          size(data.latest('home-udm', 'current').attributes.unmanaged) == 0) }}
+          (data.latest('home-udm', 'drift').attributes.inSync &&
+          size(data.latest('home-udm', 'drift').attributes.unmanaged) == 0) }}
         task:
           type: model_method
           modelIdOrName: apprise
           methodName: notify
           inputs:
             title: 'UniFi reservation drift'
-            # The data name is "current", NOT "drift" -- "drift" is the resource
-            # spec, and data.latest() takes the instance name.
+            # Data name is `drift` -- spec and instance are the same word as of
+            # extension 2026.08.04.1, so this reference is unambiguous no
+            # matter what else writes in the same run. It read "current" until
+            # then, which `inventory` also wrote.
             body: >-
-              ${{ "desired=" + string(data.latest('home-udm', 'current').attributes.desiredCount)
-              + " live=" + string(data.latest('home-udm', 'current').attributes.liveCount)
-              + " missing=" + string(size(data.latest('home-udm', 'current').attributes.missing))
-              + " mismatched=" + string(size(data.latest('home-udm', 'current').attributes.mismatched))
-              + " unmanaged=" + string(size(data.latest('home-udm', 'current').attributes.unmanaged))
-              + " poolConflicts=" + string(size(data.latest('home-udm', 'current').attributes.poolConflicts))
-              + " duplicates=" + string(size(data.latest('home-udm', 'current').attributes.duplicates)) }}
+              ${{ "desired=" + string(data.latest('home-udm', 'drift').attributes.desiredCount)
+              + " live=" + string(data.latest('home-udm', 'drift').attributes.liveCount)
+              + " missing=" + string(size(data.latest('home-udm', 'drift').attributes.missing))
+              + " mismatched=" + string(size(data.latest('home-udm', 'drift').attributes.mismatched))
+              + " unmanaged=" + string(size(data.latest('home-udm', 'drift').attributes.unmanaged))
+              + " poolConflicts=" + string(size(data.latest('home-udm', 'drift').attributes.poolConflicts))
+              + " duplicates=" + string(size(data.latest('home-udm', 'drift').attributes.duplicates)) }}
             type: warning
             format: markdown
         dependsOn: []
@@ -117,7 +119,7 @@ jobs:
         #
         # Caveat this cuts both ways: it is why a broken CEL expression here
         # showed up as a green run. If you edit the expressions above, check
-        # `swamp workflow history get unifi-drift-watch` for a failed
+        # `swamp workflow history get @sntxrr/unifi-drift-watch` for a failed
         # notify-drift step rather than trusting the run status.
         allowFailure: true
     dependsOn:
@@ -140,12 +142,16 @@ jobs:
         dependsOn: []
         weight: 0
         allowFailure: false
-    # Runs LAST, and that is load-bearing. `inventory` and `drift` both write
-    # their result under the data name "current" (the extension does not
-    # namespace instance names by resource spec), so whichever runs later wins
-    # data.latest('home-udm', 'current'). Ordering inventory after the alert is
-    # what guarantees the gate above reads a drift report and not a host list.
-    # Do not reorder these jobs without changing how the alert reads its data.
+    # Runs last, but as of extension 2026.08.04.1 that is no longer
+    # load-bearing. `drift` used to write its result under the data name
+    # "current", which `inventory` also writes, so whichever ran later won
+    # data.latest('home-udm', 'current') -- and only this ordering kept the
+    # alert reading a drift report rather than a host list. `drift` now writes
+    # to an instance named after its own spec, so the two no longer collide and
+    # reordering these jobs cannot silently break the gate.
+    #
+    # Kept last anyway: the inventory is the slower call and nothing depends on
+    # it, so there is no reason to make the alert wait behind it.
     dependsOn:
       - job: alert
         condition:

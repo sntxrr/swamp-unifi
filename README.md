@@ -73,6 +73,31 @@ swamp model @sntxrr/unifi/dhcp_reservation method run apply home-udm \
 }
 ```
 
+## Scheduled watchers
+
+Two read-only workflows ship with the extension, so drift gets noticed without
+being asked:
+
+```bash
+swamp workflow run @sntxrr/unifi-drift-watch --input-file desired.json
+swamp workflow run @sntxrr/unifi-device-drift-watch --input-file devices.json
+```
+
+| Workflow | Watches |
+| --- | --- |
+| `@sntxrr/unifi-drift-watch` | DHCP reservations, plus a dated host inventory |
+| `@sntxrr/unifi-device-drift-watch` | Static pins on adopted APs and switches |
+
+Both expect a `home-udm` controller instance and an `apprise` notifier instance,
+and both stay silent unless something has actually drifted — notification is
+gated on the finding via a step `guard`, not on run status. Neither carries a
+trigger: the desired set lives in your file, not in the workflow. Details in the
+[extension README](./extensions/models/unifi-dhcp-reservation/README.md#bundled-workflows).
+
+> Upgrading from an earlier version: `drift` now writes to the data instance
+> `drift` rather than `current`, which `inventory` also wrote. See the
+> [breaking-change note](./extensions/models/unifi-dhcp-reservation/README.md#what-drift-reports).
+
 ## Development
 
 ```bash

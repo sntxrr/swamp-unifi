@@ -46,6 +46,21 @@ table and still be wrong about reality.
 
 `inSync` is true when `missing`, `mismatched` and `duplicates` are all empty.
 
+> **Breaking change in 2026.08.04.1** — `drift` now writes its result to the
+> data instance **`drift`**, not `current`. Read it with
+> `data.latest('<model>', 'drift')`.
+>
+> `inventory` also writes an instance named `current`, and two specs sharing an
+> instance name means the later write silently wins. Any workflow running both
+> methods had a drift report that survived on job ordering alone — alert before
+> snapshot, or the gate reads a host list with no `inSync` field at all. Each
+> method now writes an instance named after its own spec, the convention
+> `device_drift` already followed, so they cannot collide.
+>
+> **If you upgrade:** change any `data.latest(model, 'current')` that meant the
+> drift report to `data.latest(model, 'drift')`. References to `current` that
+> meant the *inventory* are unaffected and still correct.
+
 ### What `verify` reports
 
 - **confirmed** — host is online at exactly the desired address
@@ -210,6 +225,52 @@ swamp model @sntxrr/unifi/dhcp_reservation method run device_pin home-udm \
 
 MAC addresses are normalised, so `02:00:5E:00:53:01`, `02-00-5e-00-53-01` and
 `02005e005301` all match the same client.
+
+## Bundled workflows
+
+Two scheduled watchers ship with the extension. Both are read-only — the
+reconciling methods (`apply`, `set_pool`, `device_pin`) are deliberately not
+wired in, so they report a problem and never quietly fix one.
+
+| Workflow | Watches | Input file |
+| --- | --- | --- |
+| `@sntxrr/unifi-drift-watch` | DHCP reservations, plus a dated host inventory | your desired reservation set |
+| `@sntxrr/unifi-device-drift-watch` | Static pins on adopted APs/switches | your desired device set |
+
+```bash
+swamp workflow run @sntxrr/unifi-drift-watch --input-file desired.json
+swamp workflow run @sntxrr/unifi-device-drift-watch --input-file devices.json
+```
+
+Both expect a model instance named `home-udm` for the controller and one named
+`apprise` for notification ([`@sntxrr/apprise-notify`](https://swamp-club.com)).
+Neither has a trigger, on purpose: the desired set is an array whose single
+source of truth is your own file, and baking it into a trigger block would fork
+that.
+
+### Staying quiet when nothing is wrong
+
+Notification is gated by a step `guard` — a CEL predicate evaluated before the
+step where **truthy means skip**:
+
+```yaml
+guard: >-
+  ${{ !inputs.notify ||
+  (data.latest('home-udm', 'drift').attributes.inSync &&
+  size(data.latest('home-udm', 'drift').attributes.unmanaged) == 0) }}
+```
+
+The gate is broader than `inSync` alone, which treats an `unmanaged` reservation
+— one on the controller nobody declared — as informational. If your desired set
+describes everything that should exist, an unmanaged entry appeared without
+being asked for, which is worth waking up for.
+
+These used Apprise's own `when` argument until 2026.08.04.1. The guard is the
+better home for it: the gate belongs to the decision rather than the transport,
+so it reads the same whatever notifier you point it at, and `when` is an Apprise
+feature that other notifiers do not have. One consequence — `when` invoked the
+notifier and let it decline, leaving a record every run; a guard does not invoke
+it at all.
 
 ## Notes
 

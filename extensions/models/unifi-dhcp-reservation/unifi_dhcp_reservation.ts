@@ -1223,10 +1223,19 @@ export const model = {
             );
           }
 
-          // "latest" is reserved by swamp for internal use.
+          // Instance name matches the spec name, so `data.latest(model,
+          // "drift")` is unambiguous no matter what else writes in the same
+          // run. It was "current" until 2026.08.04, which collided with
+          // `inventory`'s instance of the same name -- the two specs share an
+          // instance, so whichever ran last silently overwrote the other. That
+          // only worked because unifi-drift-watch happens to alert before it
+          // snapshots; reordering those jobs would have made the drift gate
+          // read an inventory record with no `inSync` field at all.
+          //
+          // ("latest" itself is reserved by swamp and cannot be used here.)
           const handle = await context.writeResource(
             "drift",
-            "current",
+            "drift",
             result,
           );
           return { dataHandles: [handle] };
