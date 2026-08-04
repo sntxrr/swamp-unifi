@@ -74,13 +74,32 @@ jobs:
     steps:
       - name: notify-device-drift
         description: >-
-          Gated by the model's own `when` argument, since swamp step conditions
-          are status-based and cannot express a predicate over step output.
+          Gated by a step `guard` -- a CEL predicate evaluated before the step,
+          where TRUTHY MEANS SKIP. Read it as "skip when notification is off,
+          or when the fabric already matches the desired pins".
+
+          This used Apprise's own `when` argument until 2026-08-04, on the
+          belief that swamp had no step-level way to branch on step output.
+          That is true of `dependsOn` conditions, which are status-based, but
+          not of `guard`. The gate belongs to the decision rather than to the
+          transport, so it now reads the same whatever notifier this points at.
+          See the matching note in unifi-drift-watch.
+
+          Behaviour change worth knowing: `when` invoked the notifier and let
+          it decline, leaving an apprise record with skipped=true every hour.
+          A guard skips the step outright, so `swamp data get apprise current`
+          now only moves when a notification actually fires.
 
           Includes `undeclared` in the gate. `inSync` covers mismatched,
           unpinned and unadopted devices but treats a device pinned static
           without being declared as informational -- and a static pin nobody
           asked for is exactly the kind of quiet change worth catching.
+          Negated for the guard, that reads: skip only when it is in sync AND
+          nothing undeclared turned up.
+        guard: >-
+          ${{ !inputs.notify ||
+          (data.latest('home-udm', 'device_drift').attributes.inSync &&
+          size(data.latest('home-udm', 'device_drift').attributes.undeclared) == 0) }}
         task:
           type: model_method
           modelIdOrName: apprise
@@ -99,10 +118,6 @@ jobs:
               + " undeclared=" + string(size(data.latest('home-udm', 'device_drift').attributes.undeclared)) }}
             type: warning
             format: markdown
-            when: >-
-              ${{ inputs.notify &&
-              (data.latest('home-udm', 'device_drift').attributes.inSync == false ||
-              size(data.latest('home-udm', 'device_drift').attributes.undeclared) > 0) }}
         dependsOn: []
         weight: 0
         # Non-fatal so a dead notifier cannot fail an otherwise good check --

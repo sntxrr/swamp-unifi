@@ -61,9 +61,22 @@ jobs:
     steps:
       - name: notify-drift
         description: >-
-          Gated by the model's own `when` argument rather than a step
-          condition, because swamp step conditions are status-based and cannot
-          express a predicate over step output.
+          Gated by a step `guard` -- a CEL predicate evaluated before the step,
+          where TRUTHY MEANS SKIP. Read it as "skip when notification is off,
+          or when the controller already matches the desired set".
+
+          This used Apprise's own `when` argument until 2026-08-04, on the
+          belief that swamp had no step-level way to branch on step output.
+          That is true of `dependsOn` conditions, which are status-based, but
+          not of `guard`. The guard is the better home for it because the gate
+          belongs to the decision rather than to the transport: it reads the
+          same whatever notifier this points at, and `when` is an Apprise
+          feature that other notifiers do not have.
+
+          Behaviour change worth knowing: `when` invoked the notifier and let
+          it decline, leaving an apprise record with skipped=true every hour.
+          A guard skips the step outright, so `swamp data get apprise current`
+          now only moves when a notification actually fires.
 
           The gate is broader than `inSync` alone. `inSync` covers missing,
           mismatched, duplicate and pool-conflicting entries but treats
@@ -71,7 +84,12 @@ jobs:
           -- as informational. Since desired-phase2.json now describes all 23
           reservations that should exist, any unmanaged entry is by definition
           something that appeared without being declared, which is exactly the
-          case worth waking up for.
+          case worth waking up for. Negated for the guard, that reads: skip
+          only when it is in sync AND nothing unmanaged turned up.
+        guard: >-
+          ${{ !inputs.notify ||
+          (data.latest('home-udm', 'current').attributes.inSync &&
+          size(data.latest('home-udm', 'current').attributes.unmanaged) == 0) }}
         task:
           type: model_method
           modelIdOrName: apprise
@@ -90,10 +108,6 @@ jobs:
               + " duplicates=" + string(size(data.latest('home-udm', 'current').attributes.duplicates)) }}
             type: warning
             format: markdown
-            when: >-
-              ${{ inputs.notify &&
-              (data.latest('home-udm', 'current').attributes.inSync == false ||
-              size(data.latest('home-udm', 'current').attributes.unmanaged) > 0) }}
         dependsOn: []
         weight: 0
         # An undeliverable notification must not turn a successful drift check
