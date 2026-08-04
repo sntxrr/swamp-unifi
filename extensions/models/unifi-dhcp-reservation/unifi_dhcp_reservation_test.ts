@@ -384,6 +384,11 @@ Deno.test("computeVerification flags adopted UniFi hardware as unreservable", ()
   // The controller rejects a fixed-IP reservation for anything it manages as a
   // device with api.err.FixedIpAlreadyUsedByDevice, so this has to be caught
   // before apply rather than surfacing as a 400 per device.
+  //
+  // Adoption is decided by presence in the devices list, never by the MAC's
+  // vendor prefix, so a documentation MAC works here. This fixture used to
+  // carry a real Ubiquiti OUI from an actual access point; nothing needed it
+  // to be real.
   const v = computeVerification(
     [{ mac: "02:00:5e:00:53:07", ip: "192.0.2.30", name: "ap-back" }],
     [],
