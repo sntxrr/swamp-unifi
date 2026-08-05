@@ -1,0 +1,28 @@
+swampVersion: 20260720.234931.0
+initializedAt: "2026-07-21T21:21:09.500Z"
+repoId: 4fc46a62-008b-4f08-bbd4-c7584b8884a8
+tools:
+  - claude
+gitignoreManaged: true
+
+# The datastore block is deliberately absent. It names an S3 bucket, and a
+# bucket name is the one piece of this file worth not publishing -- the bucket
+# is locked down, so the name is an information disclosure rather than an
+# access hole, but it still makes a target easier to find. Same reasoning as
+# swamp-homelab, which tracks only its .example copy for exactly this reason.
+#
+# To bootstrap locally, copy this to .swamp.yaml and run:
+#   swamp datastore setup extension @swamp/s3-datastore \
+#     --namespace "$(scutil --get ComputerName)-unifi" \
+#     --config '{"bucket":"<bucket>","region":"<region>","prefix":"swamp"}'
+#
+# The namespace is prefixed with the HOST name, not a generic "laptop". Each
+# machine that runs the drift watchers keeps its own namespace, so two hosts
+# checking the same controller never write over each other's history. This host
+# is `ufo`; the namespace here is `ufo-unifi`.
+#
+# Renaming a namespace later is NOT just an S3 prefix copy -- swamp caches the
+# namespace under ~/.swamp/repos/<repoId>/<namespace>/ with a sibling
+# .datastore-index.json, and it will re-materialise any OTHER namespace it
+# still finds in the bucket as a subdirectory of the current one. Set the name
+# you want up front.

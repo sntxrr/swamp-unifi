@@ -29,3 +29,9 @@
 # --input-file, exactly as they read desired-phase2.json.
 /fabric-devices.json
 /rollback-inventory-*.json
+
+# .swamp.yaml carries the datastore block, which names an S3 bucket. The bucket
+# is locked down, so the name is an information disclosure rather than an access
+# hole -- but it still makes a target easier to find, and this repo is public.
+# Only .swamp.yaml.example is tracked.
+.swamp.yaml
