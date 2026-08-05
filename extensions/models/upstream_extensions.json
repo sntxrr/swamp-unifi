@@ -12,5 +12,42 @@
     "checksum": "dce8c8d0cbf79924d155cab3e63f77bad7c4cbf1d644cf600b1d3b276131c448",
     "filesChecksum": "eed46da2ff0d309f84018f72f9e3e593d1415946593935e2a846937d6a29f513",
     "serverUrl": "https://swamp-club.com"
+  },
+  "@swamp/s3-datastore": {
+    "version": "2026.07.31.1",
+    "pulledAt": "2026-08-01T18:32:48.436Z",
+    "files": [
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/s3.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/atomic_write.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/s3_cache_sync.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/s3_verifier.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/s3_client.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/tracing.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/interfaces.ts",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/datastores/_lib/s3_lock.ts",
+      ".swamp/datastore-bundles/7c811b12/s3.js",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/files/README.md",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/files/LICENSE.txt",
+      ".swamp/pulled-extensions/@swamp/s3-datastore/manifest.yaml"
+    ],
+    "checksum": "d16d76f669038b5c96dc9e72a604746138b730daf9c5a4f47e9afb3907eebb43",
+    "filesChecksum": "12b3cdfa1cd4eff01d3d9cf082ef6a2d54940dbc0ed7eada2b693b006da89449",
+    "serverUrl": "https://swamp-club.com"
+  },
+  "@sntxrr/swamp-triage": {
+    "version": "2026.08.04.3",
+    "pulledAt": "2026-08-04T21:54:33.277Z",
+    "files": [
+      ".swamp/pulled-extensions/@sntxrr/swamp-triage/models/swamp_triage.ts",
+      ".swamp/pulled-extensions/@sntxrr/swamp-triage/workflows/workflow-cd960c91-5a03-47f0-8823-b272a37cbbad.yaml",
+      ".swamp/pulled-extensions/@sntxrr/swamp-triage/workflows/workflow-1d18f54e-b7f1-433d-a5e1-0d37c79de3fd.yaml",
+      ".swamp/bundles/f98069d0/swamp_triage.js",
+      ".swamp/pulled-extensions/@sntxrr/swamp-triage/files/LICENSE.md",
+      ".swamp/pulled-extensions/@sntxrr/swamp-triage/files/README.md",
+      ".swamp/pulled-extensions/@sntxrr/swamp-triage/manifest.yaml"
+    ],
+    "checksum": "0919ae0a03b8200a89a938e9f7133c2600765dfc2040a8f3d49a3cbb0d7f830e",
+    "filesChecksum": "addf2dd540d1ea248bcf2548d233265f96ad883d9cc2058c038fb0d18140e183",
+    "serverUrl": "https://swamp-club.com"
   }
 }
