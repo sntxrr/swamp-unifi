@@ -35,8 +35,8 @@
     "serverUrl": "https://swamp-club.com"
   },
   "@sntxrr/swamp-triage": {
-    "version": "2026.08.04.3",
-    "pulledAt": "2026-08-04T21:54:33.277Z",
+    "version": "2026.08.04.4",
+    "pulledAt": "2026-08-05T01:14:14.793Z",
     "files": [
       ".swamp/pulled-extensions/@sntxrr/swamp-triage/models/swamp_triage.ts",
       ".swamp/pulled-extensions/@sntxrr/swamp-triage/workflows/workflow-cd960c91-5a03-47f0-8823-b272a37cbbad.yaml",
@@ -46,8 +46,8 @@
       ".swamp/pulled-extensions/@sntxrr/swamp-triage/files/README.md",
       ".swamp/pulled-extensions/@sntxrr/swamp-triage/manifest.yaml"
     ],
-    "checksum": "0919ae0a03b8200a89a938e9f7133c2600765dfc2040a8f3d49a3cbb0d7f830e",
-    "filesChecksum": "addf2dd540d1ea248bcf2548d233265f96ad883d9cc2058c038fb0d18140e183",
+    "checksum": "015d9552c200bba25a7edf5f465b69d67662c3fb8ac9ddd9f11957304d1a5ad6",
+    "filesChecksum": "beaf669e67fcb080a26b2407e577a78d3ce0d48a2a778cef94d98de8e01ebbb7",
     "serverUrl": "https://swamp-club.com"
   }
 }
