@@ -408,6 +408,38 @@ export async function list<T = Record<string, unknown>>(
   return (resp.data ?? []) as T[];
 }
 
+/**
+ * POST a Network API command endpoint and assert the controller accepted it.
+ *
+ * The controller answers a *rejected* command with HTTP 200 and
+ * `meta.rc: "error"`, so the status line alone cannot distinguish success.
+ * {@link list} already guards this on reads; commands need the same check, or a
+ * refusal is silently recorded as a success.
+ *
+ * @param client An authenticated session.
+ * @param endpoint Endpoint below the site root, e.g. `/cmd/stamgr`.
+ * @param body The command payload.
+ * @throws If the controller reports a non-`ok` result code.
+ */
+export async function command(
+  client: UnifiClient,
+  endpoint: string,
+  body: unknown,
+): Promise<void> {
+  const raw = await client.request<unknown>(
+    networkPath(client.site, endpoint),
+    "POST",
+    body,
+  );
+  const resp = UnifiListResponseSchema.parse(raw);
+  if (resp.meta?.rc && resp.meta.rc !== "ok") {
+    throw new Error(
+      `UniFi API command ${endpoint} returned rc=${resp.meta.rc}: ` +
+        `${resp.meta.msg ?? "no message"}`,
+    );
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Schemas
  * ------------------------------------------------------------------ */
@@ -1959,11 +1991,10 @@ export const model = {
                   // `forget-sta` purges the client object and its history.
                   // Batched by the controller, but issued one MAC at a time
                   // so a single rejection cannot mask the rest.
-                  await client.request(
-                    networkPath(client.site, "/cmd/stamgr"),
-                    "POST",
-                    { cmd: "forget-sta", macs: [mac] },
-                  );
+                  await command(client, "/cmd/stamgr", {
+                    cmd: "forget-sta",
+                    macs: [mac],
+                  });
                 }
               } catch (err) {
                 action = "failed";

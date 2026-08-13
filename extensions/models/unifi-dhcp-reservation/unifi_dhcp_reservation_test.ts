@@ -8,6 +8,7 @@ import {
   base32Decode,
   buildInventory,
   classifyForget,
+  command,
   computeDrift,
   computeVerification,
   inPool,
@@ -648,4 +649,57 @@ Deno.test("classifyForget treats a fixed_ip with use_fixedip off as unreserved",
   );
   assertEquals(v.action, "forgotten");
   assertEquals(v.wasReserved, false);
+});
+
+/* ---------------- command() result-code guard ---------------- */
+
+function fakeClient(response: unknown, capture?: { path?: string; body?: unknown }) {
+  return {
+    baseUrl: "https://controller.example.com",
+    site: "default",
+    // deno-lint-ignore no-explicit-any
+    request: (path: string, _method?: string, body?: unknown): Promise<any> => {
+      if (capture) {
+        capture.path = path;
+        capture.body = body;
+      }
+      return Promise.resolve(response);
+    },
+    cleanup: () => Promise.resolve(),
+  };
+}
+
+Deno.test("command resolves when the controller reports rc=ok", async () => {
+  await command(fakeClient({ meta: { rc: "ok" }, data: [] }), "/cmd/stamgr", {
+    cmd: "forget-sta",
+  });
+});
+
+Deno.test("command throws when the controller reports rc=error on HTTP 200", async () => {
+  // The failure this guards: UniFi answers a *rejected* command with HTTP 200,
+  // so status alone would record a refusal as a success.
+  const err = await command(
+    fakeClient({ meta: { rc: "error", msg: "api.err.NoSiteContext" } }),
+    "/cmd/stamgr",
+    { cmd: "forget-sta" },
+  ).then(() => null, (e: Error) => e);
+
+  assertEquals(err instanceof Error, true);
+  assertStringIncludes(err!.message, "rc=error");
+  assertStringIncludes(err!.message, "api.err.NoSiteContext");
+  assertStringIncludes(err!.message, "/cmd/stamgr");
+});
+
+Deno.test("command tolerates a response carrying no meta block", async () => {
+  await command(fakeClient({ data: [] }), "/cmd/stamgr", { cmd: "forget-sta" });
+});
+
+Deno.test("command posts to the site-scoped path", async () => {
+  const seen: { path?: string; body?: unknown } = {};
+  await command(fakeClient({ meta: { rc: "ok" } }, seen), "/cmd/stamgr", {
+    cmd: "forget-sta",
+    macs: ["02:00:5e:00:53:0b"],
+  });
+  assertEquals(seen.path, "/proxy/network/api/s/default/cmd/stamgr");
+  assertEquals(seen.body, { cmd: "forget-sta", macs: ["02:00:5e:00:53:0b"] });
 });
