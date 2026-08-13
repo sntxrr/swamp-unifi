@@ -1,8 +1,13 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import {
+  assertEquals,
+  assertStringIncludes,
+  assertThrows,
+} from "jsr:@std/assert@1";
 import {
   analysePoolChange,
   base32Decode,
   buildInventory,
+  classifyForget,
   computeDrift,
   computeVerification,
   inPool,
@@ -573,4 +578,74 @@ Deno.test("buildInventory sorts hosts with no address last", () => {
   );
   assertEquals(inv[0].ip, "192.0.2.150");
   assertEquals(inv[1].ip, undefined);
+});
+
+/* ---------------- classifyForget ---------------- */
+
+const RESERVED_USER = {
+  _id: "u1",
+  mac: "02:00:5e:00:53:0a",
+  name: "Elgato Keylight",
+  fixed_ip: "192.0.2.56",
+  use_fixedip: true,
+};
+
+const STALE_USER = {
+  _id: "u2",
+  mac: "02:00:5e:00:53:0b",
+  name: "Spare Key Light",
+};
+
+Deno.test("classifyForget removes a stale record the controller still holds", () => {
+  const v = classifyForget("02:00:5e:00:53:0b", STALE_USER, false, false);
+  assertEquals(v.action, "forgotten");
+  assertEquals(v.wasReserved, false);
+  assertEquals(v.wasActive, false);
+});
+
+Deno.test("classifyForget refuses a MAC holding a reservation", () => {
+  const v = classifyForget("02:00:5e:00:53:0a", RESERVED_USER, false, false);
+  assertEquals(v.action, "skipped");
+  assertEquals(v.wasReserved, true);
+  assertStringIncludes(v.reason ?? "", "192.0.2.56");
+});
+
+Deno.test("classifyForget refuses a MAC holding a live lease", () => {
+  const v = classifyForget("02:00:5e:00:53:0b", STALE_USER, true, false);
+  assertEquals(v.action, "skipped");
+  assertEquals(v.wasActive, true);
+  assertStringIncludes(v.reason ?? "", "not stale");
+});
+
+Deno.test("classifyForget honours force over the reservation guard", () => {
+  const v = classifyForget("02:00:5e:00:53:0a", RESERVED_USER, false, true);
+  assertEquals(v.action, "forgotten");
+  // force does not hide what was destroyed — the flag is still recorded.
+  assertEquals(v.wasReserved, true);
+});
+
+Deno.test("classifyForget honours force over the live-lease guard", () => {
+  const v = classifyForget("02:00:5e:00:53:0b", STALE_USER, true, true);
+  assertEquals(v.action, "forgotten");
+  assertEquals(v.wasActive, true);
+});
+
+Deno.test("classifyForget reports an unknown MAC as not_found, not failed", () => {
+  const v = classifyForget("aa:bb:cc:dd:ee:ff", undefined, false, false);
+  assertEquals(v.action, "not_found");
+  assertEquals(v.wasReserved, false);
+  assertStringIncludes(v.reason ?? "", "does not know");
+});
+
+Deno.test("classifyForget treats a fixed_ip with use_fixedip off as unreserved", () => {
+  // The exact shape that stranded the Key Light: an address was typed in but
+  // never enforced, so the record is not actually holding a reservation.
+  const v = classifyForget(
+    "02:00:5e:00:53:0a",
+    { ...RESERVED_USER, use_fixedip: false },
+    false,
+    false,
+  );
+  assertEquals(v.action, "forgotten");
+  assertEquals(v.wasReserved, false);
 });
