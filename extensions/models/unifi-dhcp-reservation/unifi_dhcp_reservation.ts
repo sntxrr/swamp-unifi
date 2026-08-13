@@ -625,9 +625,87 @@ const ApplyResultSchema = z.object({
   ),
 });
 
+const ForgetResultSchema = z.object({
+  mac: z.string(),
+  action: z.enum(["forgotten", "skipped", "not_found", "failed"]),
+  reason: z.string().optional().describe(
+    "Why a MAC was skipped, or why it failed.",
+  ),
+  label: z.string().optional().describe(
+    "Name the controller held for the client, captured before removal.",
+  ),
+  was_reserved: z.boolean().describe(
+    "Held a fixed-IP reservation at the time of the call. Forgetting one " +
+      "destroys the reservation, so this is refused unless `force` is set.",
+  ),
+  was_active: z.boolean().describe(
+    "Held a live lease at the time of the call — the client is not stale.",
+  ),
+  dryRun: z.boolean().describe(
+    "True when no write was actually issued. Without this, a rehearsal is " +
+      "indistinguishable from a real run in stored data.",
+  ),
+});
+
 /* ------------------------------------------------------------------ *
  * Pure comparison logic (exported for tests)
  * ------------------------------------------------------------------ */
+
+/**
+ * Decide whether one MAC may be forgotten.
+ *
+ * Two states block removal, because both mean the record is not the stale
+ * leftover the caller assumes it is: a client holding a fixed-IP reservation
+ * (forgetting it silently destroys the reservation) and a client holding a
+ * live lease (the device is still on the network). `force` overrides both.
+ *
+ * @param mac Normalized MAC being considered.
+ * @param user The controller's client object, if it knows this MAC.
+ * @param isActive Whether the MAC currently holds a lease.
+ * @param force Override the reserved/active guards.
+ * @returns The action to take and, when skipping, the reason.
+ */
+export function classifyForget(
+  mac: string,
+  user: UnifiUser | undefined,
+  isActive: boolean,
+  force: boolean,
+): {
+  action: z.infer<typeof ForgetResultSchema>["action"];
+  reason?: string;
+  wasReserved: boolean;
+  wasActive: boolean;
+} {
+  const wasReserved = user?.use_fixedip === true && !!user.fixed_ip;
+  const wasActive = isActive;
+
+  if (!user) {
+    return {
+      action: "not_found",
+      reason: `controller does not know ${mac}`,
+      wasReserved: false,
+      wasActive,
+    };
+  }
+  if (wasReserved && !force) {
+    return {
+      action: "skipped",
+      reason:
+        `holds a fixed-IP reservation (${user.fixed_ip}) — pass force to remove it anyway`,
+      wasReserved,
+      wasActive,
+    };
+  }
+  if (wasActive && !force) {
+    return {
+      action: "skipped",
+      reason: "currently holds a lease — the client is not stale",
+      wasReserved,
+      wasActive,
+    };
+  }
+  return { action: "forgotten", wasReserved, wasActive };
+}
 
 /**
  * Compare a desired reservation set against what the controller holds.
@@ -1067,16 +1145,24 @@ async function loadPool(
 /**
  * Swamp model for UniFi DHCP fixed-IP reservations.
  *
- * Three methods:
- * - `sync` — store one resource per reservation the controller holds. Read-only.
- * - `drift` — compare a desired set against the controller. Read-only.
- * - `apply` — reconcile the controller to the desired set. Writes; supports
- *   `dryRun`, and refuses a desired set that assigns one address to multiple
- *   MACs rather than letting the last write win.
+ * Read-only:
+ * - `sync` — store one resource per reservation the controller holds.
+ * - `drift` — compare a desired set against the controller.
+ * - `verify` — pre-flight a desired set against live DHCP leases.
+ * - `inventory` — every host the controller knows, clients and hardware.
+ *
+ * Writes:
+ * - `apply` — reconcile the controller to the desired set. Supports `dryRun`,
+ *   and refuses a desired set that assigns one address to multiple MACs
+ *   rather than letting the last write win.
+ * - `set_pool` — change the DHCP range, reporting what it displaces first.
+ * - `device_pin` — pin adopted hardware, which cannot hold reservations.
+ * - `forget_client` — remove stale client records. Refuses a MAC holding a
+ *   reservation or a live lease unless `force` is set.
  */
 export const model = {
   type: "@sntxrr/unifi/dhcp_reservation",
-  version: "2026.07.31.1",
+  version: "2026.08.13.1",
   globalArguments: UnifiGlobalArgsSchema,
   resources: {
     reservation: {
@@ -1121,6 +1207,12 @@ export const model = {
     apply_result: {
       description: "Outcome of reconciling one reservation.",
       schema: ApplyResultSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 5,
+    },
+    forget_result: {
+      description: "Outcome of forgetting one stale client record.",
+      schema: ForgetResultSchema,
       lifetime: "infinite" as const,
       garbageCollection: 5,
     },
@@ -1795,6 +1887,114 @@ export const model = {
             {
               mode: args.dryRun ? "Dry run" : "Applied",
               n: args.desired.length,
+            },
+          );
+          return { dataHandles: handles };
+        } finally {
+          await client.cleanup();
+        }
+      },
+    },
+
+    forget_client: {
+      description:
+        "Forget stale client records the controller still remembers — the " +
+        "API behind the UI's Forget Client. Refuses any MAC that holds a " +
+        "fixed-IP reservation or a live lease unless `force` is set, since " +
+        "neither is the stale leftover the caller is assuming. Fans out " +
+        "over every MAC in a single run. Supports dryRun. WRITES.",
+      arguments: z.object({
+        macs: z.array(z.string()).min(1).describe(
+          "MACs to forget. Normalized before use, so any separator works.",
+        ),
+        force: z.boolean().default(false).describe(
+          "Forget even a MAC that holds a reservation or a live lease.",
+        ),
+        dryRun: z.boolean().default(false).describe(
+          "Report the actions that would be taken without writing.",
+        ),
+      }),
+      execute: async (
+        args: { macs: string[]; force: boolean; dryRun: boolean },
+        context: Context,
+      ) => {
+        context.logger.info(
+          "Forgetting {n} client(s) on {host} (force={force}, dryRun={dry})",
+          {
+            n: args.macs.length,
+            host: context.globalArgs.host,
+            force: args.force,
+            dry: args.dryRun,
+          },
+        );
+        const client = await login(context.globalArgs);
+        try {
+          const users = parseUsers(
+            await list<UnifiUser>(client, "/rest/user"),
+            context.logger,
+          );
+          const liveByMac = new Map(
+            users.map((u) => [normalizeMac(u.mac), u]),
+          );
+          const activeMacs = new Set(
+            (await list<ActiveClient>(client, "/stat/sta"))
+              .map((c) => normalizeMac(c.mac)),
+          );
+
+          const handles: unknown[] = [];
+          for (const raw of args.macs) {
+            const mac = normalizeMac(raw);
+            const existing = liveByMac.get(mac);
+            const verdict = classifyForget(
+              mac,
+              existing,
+              activeMacs.has(mac),
+              args.force,
+            );
+            let { action, reason } = verdict;
+
+            if (action === "forgotten") {
+              try {
+                if (!args.dryRun) {
+                  // `forget-sta` purges the client object and its history.
+                  // Batched by the controller, but issued one MAC at a time
+                  // so a single rejection cannot mask the rest.
+                  await client.request(
+                    networkPath(client.site, "/cmd/stamgr"),
+                    "POST",
+                    { cmd: "forget-sta", macs: [mac] },
+                  );
+                }
+              } catch (err) {
+                action = "failed";
+                reason = err instanceof Error ? err.message : String(err);
+                context.logger.warn("Forgetting {mac} failed: {reason}", {
+                  mac,
+                  reason,
+                });
+              }
+            } else if (action === "skipped") {
+              context.logger.warn("Skipped {mac}: {reason}", { mac, reason });
+            }
+
+            handles.push(
+              await context.writeResource("forget_result", mac, {
+                mac,
+                action,
+                reason,
+                label: existing?.name ?? existing?.hostname,
+                was_reserved: verdict.wasReserved,
+                was_active: verdict.wasActive,
+                dryRun: args.dryRun,
+              }),
+            );
+          }
+
+          context.logger.info(
+            "{mode}: {n} MAC(s) processed",
+            {
+              mode: args.dryRun ? "Dry run" : "Forgot",
+              n: args.macs.length,
             },
           );
           return { dataHandles: handles };

@@ -29,6 +29,7 @@ reports the disagreements before they become outages.
 | `set_pool` | **yes** | Change the DHCP range. Supports `dryRun`. |
 | `device_drift` | no | Compare desired static pins against adopted hardware. |
 | `device_pin` | **yes** | Static address in device config for adopted hardware. Supports `dryRun`. |
+| `forget_client` | **yes** | Remove stale client records. Supports `dryRun`. |
 
 `drift` and `verify` answer different questions. `drift` asks *what has the
 controller been told?*; `verify` asks *where are these hosts actually sitting
@@ -149,6 +150,29 @@ re-lease" there would be wrong: there is no lease to expire. The controller
 cannot distinguish a static address from a leased one (both just appear on
 `/stat/sta`), so old-pool membership is the only available proxy.
 
+### What `forget_client` refuses
+
+The controller remembers every client it has ever seen, so the client list
+accumulates hardware that left the network years ago. `forget_client` is the
+API behind the UI's *Forget Client*, and it prunes those records.
+
+Two states block removal, because in both the record is not the stale leftover
+the caller is assuming:
+
+- **holds a reservation** (`use_fixedip` true) — forgetting it destroys the
+  reservation silently, and the next `drift` run reports it as missing.
+- **holds a live lease** — the device is still on the network right now.
+
+`force` overrides both, but the result still records `was_reserved` and
+`was_active`, so a forced removal cannot be mistaken later for a safe one. A
+MAC the controller has never heard of comes back as `not_found` rather than
+`failed` — being already-absent is the desired end state, not an error.
+
+Note that a record carrying a `fixed_ip` with `use_fixedip` *false* does not
+count as reserved. That combination is a fixed address someone typed in but
+never enforced: the controller ignores it and hands the host a pool lease
+instead, so there is no reservation to protect.
+
 ## Authentication
 
 | Account type | Configuration |
@@ -179,7 +203,7 @@ swamp model @sntxrr/unifi/dhcp_reservation method run verify home-udm \
 
 # what is sitting at an address, and what vendor is it?
 swamp model @sntxrr/unifi/dhcp_reservation method run inventory home-udm \
-  --arguments '{"ips": ["192.0.2.234"]}'
+  --input '{"ips": ["192.0.2.234"]}'
 
 # reconcile — always dry-run first
 swamp model @sntxrr/unifi/dhcp_reservation method run apply home-udm \
@@ -187,11 +211,15 @@ swamp model @sntxrr/unifi/dhcp_reservation method run apply home-udm \
 
 # narrow the DHCP range, rehearsing first
 swamp model @sntxrr/unifi/dhcp_reservation method run set_pool home-udm \
-  --arguments '{"start":"192.0.2.23","stop":"192.0.2.199","dryRun":true}'
+  --input '{"start":"192.0.2.23","stop":"192.0.2.199","dryRun":true}'
 
 # pin adopted hardware, which cannot hold a reservation
 swamp model @sntxrr/unifi/dhcp_reservation method run device_pin home-udm \
   --input-file fabric-dryrun.json
+
+# prune stale client records — rehearse, then commit
+swamp model @sntxrr/unifi/dhcp_reservation method run forget_client home-udm \
+  --input '{"macs":["02:00:5e:00:53:0b"],"dryRun":true}'
 ```
 
 `fabric-dryrun.json`:
