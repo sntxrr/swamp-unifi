@@ -409,12 +409,48 @@ export async function list<T = Record<string, unknown>>(
 }
 
 /**
+ * Send a mutating request to a Network API endpoint and assert the controller
+ * accepted it.
+ *
+ * The controller answers a *rejected* write with HTTP 200 and
+ * `meta.rc: "error"`, so the status line alone cannot distinguish it from
+ * success. {@link list} already guards this on reads; every write needs the
+ * same check, or a refusal is silently recorded as a success — the caller
+ * reports the change as applied and the next drift run contradicts it.
+ *
+ * @param client An authenticated session.
+ * @param endpoint Endpoint below the site root, e.g. `/rest/user`.
+ * @param method The HTTP verb to use.
+ * @param body The request payload, if any.
+ * @returns The rows the controller returned, or an empty array.
+ * @throws If the controller reports a non-`ok` result code.
+ */
+export async function mutate<T = Record<string, unknown>>(
+  client: UnifiClient,
+  endpoint: string,
+  method: "POST" | "PUT" | "DELETE",
+  body?: unknown,
+): Promise<T[]> {
+  const raw = await client.request<unknown>(
+    networkPath(client.site, endpoint),
+    method,
+    body,
+  );
+  const resp = UnifiListResponseSchema.parse(raw);
+  if (resp.meta?.rc && resp.meta.rc !== "ok") {
+    throw new Error(
+      `UniFi API ${method} ${endpoint} returned rc=${resp.meta.rc}: ` +
+        `${resp.meta.msg ?? "no message"}`,
+    );
+  }
+  return (resp.data ?? []) as T[];
+}
+
+/**
  * POST a Network API command endpoint and assert the controller accepted it.
  *
- * The controller answers a *rejected* command with HTTP 200 and
- * `meta.rc: "error"`, so the status line alone cannot distinguish success.
- * {@link list} already guards this on reads; commands need the same check, or a
- * refusal is silently recorded as a success.
+ * Thin wrapper over {@link mutate} for the `/cmd/*` endpoints, which return
+ * nothing useful in `data`.
  *
  * @param client An authenticated session.
  * @param endpoint Endpoint below the site root, e.g. `/cmd/stamgr`.
@@ -426,18 +462,7 @@ export async function command(
   endpoint: string,
   body: unknown,
 ): Promise<void> {
-  const raw = await client.request<unknown>(
-    networkPath(client.site, endpoint),
-    "POST",
-    body,
-  );
-  const resp = UnifiListResponseSchema.parse(raw);
-  if (resp.meta?.rc && resp.meta.rc !== "ok") {
-    throw new Error(
-      `UniFi API command ${endpoint} returned rc=${resp.meta.rc}: ` +
-        `${resp.meta.msg ?? "no message"}`,
-    );
-  }
+  await mutate(client, endpoint, "POST", body);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1194,7 +1219,7 @@ async function loadPool(
  */
 export const model = {
   type: "@sntxrr/unifi/dhcp_reservation",
-  version: "2026.08.13.1",
+  version: "2026.08.13.2",
   globalArguments: UnifiGlobalArgsSchema,
   resources: {
     reservation: {
@@ -1636,11 +1661,10 @@ export const model = {
           }
 
           if (!args.dryRun) {
-            await client.request(
-              networkPath(client.site, `/rest/networkconf/${pool.id}`),
-              "PUT",
-              { dhcpd_start: args.start, dhcpd_stop: args.stop },
-            );
+            await mutate(client, `/rest/networkconf/${pool.id}`, "PUT", {
+              dhcpd_start: args.start,
+              dhcpd_stop: args.stop,
+            });
             context.logger.info("DHCP range updated");
           }
 
@@ -1729,20 +1753,16 @@ export const model = {
                 action = "unchanged";
               } else {
                 if (!args.dryRun) {
-                  await client.request(
-                    networkPath(client.site, `/rest/device/${id}`),
-                    "PUT",
-                    {
-                      config_network: {
-                        type: "static",
-                        ip: d.ip,
-                        netmask: args.netmask,
-                        gateway: args.gateway,
-                        ...(args.dns1 ? { dns1: args.dns1 } : {}),
-                        ...(args.dns2 ? { dns2: args.dns2 } : {}),
-                      },
+                  await mutate(client, `/rest/device/${id}`, "PUT", {
+                    config_network: {
+                      type: "static",
+                      ip: d.ip,
+                      netmask: args.netmask,
+                      gateway: args.gateway,
+                      ...(args.dns1 ? { dns1: args.dns1 } : {}),
+                      ...(args.dns2 ? { dns2: args.dns2 } : {}),
                     },
-                  );
+                  });
                 }
                 action = "pinned";
                 detail = `${cfg.type ?? "dhcp"} ${
@@ -1859,15 +1879,11 @@ export const model = {
                 action = "unchanged";
               } else if (existing?._id) {
                 if (!args.dryRun) {
-                  await client.request(
-                    networkPath(client.site, `/rest/user/${existing._id}`),
-                    "PUT",
-                    {
-                      use_fixedip: true,
-                      fixed_ip: entry.ip,
-                      ...(entry.name ? { name: entry.name } : {}),
-                    },
-                  );
+                  await mutate(client, `/rest/user/${existing._id}`, "PUT", {
+                    use_fixedip: true,
+                    fixed_ip: entry.ip,
+                    ...(entry.name ? { name: entry.name } : {}),
+                  });
                 }
                 action = "updated";
                 detail = existing.fixed_ip
@@ -1875,16 +1891,12 @@ export const model = {
                   : `unpinned -> ${entry.ip}`;
               } else {
                 if (!args.dryRun) {
-                  await client.request(
-                    networkPath(client.site, "/rest/user"),
-                    "POST",
-                    {
-                      mac,
-                      use_fixedip: true,
-                      fixed_ip: entry.ip,
-                      ...(entry.name ? { name: entry.name } : {}),
-                    },
-                  );
+                  await mutate(client, "/rest/user", "POST", {
+                    mac,
+                    use_fixedip: true,
+                    fixed_ip: entry.ip,
+                    ...(entry.name ? { name: entry.name } : {}),
+                  });
                 }
                 action = "created";
                 detail = `new client object pinned to ${entry.ip}`;
