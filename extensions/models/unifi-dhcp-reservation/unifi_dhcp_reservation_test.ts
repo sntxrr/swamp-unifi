@@ -9,6 +9,7 @@ import {
   buildInventory,
   classifyForget,
   command,
+  mutate,
   computeDrift,
   computeVerification,
   inPool,
@@ -651,16 +652,20 @@ Deno.test("classifyForget treats a fixed_ip with use_fixedip off as unreserved",
   assertEquals(v.wasReserved, false);
 });
 
-/* ---------------- command() result-code guard ---------------- */
+/* ---------------- mutate() / command() result-code guard ---------------- */
 
-function fakeClient(response: unknown, capture?: { path?: string; body?: unknown }) {
+function fakeClient(
+  response: unknown,
+  capture?: { path?: string; method?: string; body?: unknown },
+) {
   return {
     baseUrl: "https://controller.example.com",
     site: "default",
     // deno-lint-ignore no-explicit-any
-    request: (path: string, _method?: string, body?: unknown): Promise<any> => {
+    request: (path: string, method?: string, body?: unknown): Promise<any> => {
       if (capture) {
         capture.path = path;
+        capture.method = method;
         capture.body = body;
       }
       return Promise.resolve(response);
@@ -702,4 +707,43 @@ Deno.test("command posts to the site-scoped path", async () => {
   });
   assertEquals(seen.path, "/proxy/network/api/s/default/cmd/stamgr");
   assertEquals(seen.body, { cmd: "forget-sta", macs: ["02:00:5e:00:53:0b"] });
+});
+
+Deno.test("mutate throws when a PUT is rejected with rc=error on HTTP 200", async () => {
+  // The reservation-write path: apply reported "updated" on a refusal before
+  // this guard existed, and the next drift run then contradicted it.
+  const err = await mutate(
+    fakeClient({ meta: { rc: "error", msg: "api.err.FixedIpAlreadyUsedByDevice" } }),
+    "/rest/user/abc123",
+    "PUT",
+    { use_fixedip: true, fixed_ip: "192.0.2.56" },
+  ).then(() => null, (e: Error) => e);
+
+  assertEquals(err instanceof Error, true);
+  assertStringIncludes(err!.message, "PUT /rest/user/abc123");
+  assertStringIncludes(err!.message, "api.err.FixedIpAlreadyUsedByDevice");
+});
+
+Deno.test("mutate returns the controller's data rows on success", async () => {
+  const rows = await mutate(
+    fakeClient({ meta: { rc: "ok" }, data: [{ _id: "abc123" }] }),
+    "/rest/user",
+    "POST",
+    { mac: "02:00:5e:00:53:0b" },
+  );
+  assertEquals(rows, [{ _id: "abc123" }]);
+});
+
+Deno.test("mutate passes the verb through and scopes the path to the site", async () => {
+  const seen: { path?: string; method?: string; body?: unknown } = {};
+  await mutate(fakeClient({ meta: { rc: "ok" } }, seen), "/rest/networkconf/n1", "PUT", {
+    dhcpd_start: "192.0.2.23",
+  });
+  assertEquals(seen.method, "PUT");
+  assertEquals(seen.path, "/proxy/network/api/s/default/rest/networkconf/n1");
+  assertEquals(seen.body, { dhcpd_start: "192.0.2.23" });
+});
+
+Deno.test("mutate returns an empty array when the response carries no data", async () => {
+  assertEquals(await mutate(fakeClient({ meta: { rc: "ok" } }), "/cmd/stamgr", "POST"), []);
 });
