@@ -18,8 +18,9 @@ gitignoreManaged: true
 #
 # The namespace is prefixed with the HOST name, not a generic "laptop". Each
 # machine that runs the drift watchers keeps its own namespace, so two hosts
-# checking the same controller never write over each other's history. This host
-# is `ufo`; the namespace here is `ufo-unifi`.
+# checking the same controller never write over each other's history -- hence
+# the `scutil --get ComputerName` above rather than a literal. A box named
+# `heron` gets `heron-unifi`.
 #
 # Renaming a namespace later is NOT just an S3 prefix copy -- swamp caches the
 # namespace under ~/.swamp/repos/<repoId>/<namespace>/ with a sibling

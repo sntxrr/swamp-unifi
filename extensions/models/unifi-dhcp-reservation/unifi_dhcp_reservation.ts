@@ -143,7 +143,7 @@ export function inPool(ip: string, start?: string, stop?: string): boolean {
 /**
  * Canonicalise a MAC address to lowercase colon-separated form.
  *
- * Lets `02:00:5E:00:53:01`, `bc-24-11-ce-ea-1f` and `02005e005301` all compare
+ * Lets `02:00:5E:00:53:01`, `02-00-5e-00-53-01` and `02005e005301` all compare
  * equal, since the controller and hand-written desired sets rarely agree on
  * separator style.
  *
@@ -1219,7 +1219,7 @@ async function loadPool(
  */
 export const model = {
   type: "@sntxrr/unifi/dhcp_reservation",
-  version: "2026.08.13.2",
+  version: "2026.08.20.1",
   globalArguments: UnifiGlobalArgsSchema,
   resources: {
     reservation: {

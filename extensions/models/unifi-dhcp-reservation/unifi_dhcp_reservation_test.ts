@@ -468,7 +468,7 @@ Deno.test("analysePoolChange marks a displaced but reserved host as safe", () =>
   // Inside the old pool, outside the new one, but pinned — out-of-pool
   // reservations are honoured, so it keeps its address.
   const r = analysePoolChange(
-    [entry("192.0.2.220", { reserved: true, label: "udsliving" })],
+    [entry("192.0.2.220", { reserved: true, label: "sw-front" })],
     OLD_POOL,
     "192.0.2.23",
     "192.0.2.199",
