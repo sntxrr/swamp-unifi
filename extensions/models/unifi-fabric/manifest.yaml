@@ -1,0 +1,27 @@
+manifestVersion: 1
+
+name: "@sntxrr/unifi-fabric"
+version: "2026.08.20.1"
+description: "Structural health monitoring for a UniFi fabric. The `@sntxrr/unifi-fabric/topology` model's `check` method compares a declared topology against live `/stat/device` rows and reports the failures that outcome-based monitoring cannot see: a device expected on the wire that has silently fallen back to a wireless mesh uplink, attachment to the wrong upstream device, links negotiated below their expected speed, ports carrying error counters, and — the one with no equivalent elsewhere — ports that are down but have carried real traffic before, which identifies a run that used to work. An access point that loses its wired uplink does not fail; it meshes, keeps serving clients, and every uptime check stays green while latency quietly goes from sub-millisecond to tens of milliseconds and jittery. `uplink.type` flipping from `wire` to `wireless` is a boolean, so it is asserted exactly rather than thresholded. Read-only: never writes to the controller. Emits a flat Prometheus-ready metric series alongside the verdict, including for healthy devices, so alerts can fire on a series dropping to zero rather than on a document changing shape. Authenticates with an API key over `X-API-KEY`, which sidesteps the HTTP 499 that MFA-enabled SSO accounts return for password logins."
+repository: "https://github.com/sntxrr/swamp-unifi"
+
+paths:
+  base: manifest
+
+models:
+  - unifi_fabric.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - unifi
+  - ubiquiti
+  - udm
+  - topology
+  - drift
+  - monitoring
+  - networking
+  - prometheus
+  - homelab
