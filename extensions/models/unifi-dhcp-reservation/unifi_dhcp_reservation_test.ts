@@ -14,8 +14,11 @@ import {
   computeVerification,
   inPool,
   ipToInt,
+  isTotpReplayRejection,
+  msUntilStepAfter,
   normalizeMac,
   totpCode,
+  totpStep,
 } from "./unifi_dhcp_reservation.ts";
 
 /* ---------------- TOTP ---------------- */
@@ -53,6 +56,77 @@ Deno.test("totpCode is stable within a 30s step and rolls at the boundary", asyn
   const c = await totpCode(RFC_SECRET, 60_000);
   assertEquals(a, b);
   assertEquals(a === c, false);
+});
+
+/* ------- TOTP single-use retry -------
+ *
+ * The controller burns each code on first use, so a workflow running two
+ * methods four seconds apart sends the same code twice and loses the second.
+ * These cover the arithmetic that decides how long to wait for a fresh one.
+ */
+
+Deno.test("totpStep agrees with the counter totpCode derives from", async () => {
+  // Same step must produce the same code; the next step must not.
+  assertEquals(totpStep(59_000), totpStep(30_000));
+  assertEquals(
+    await totpCode(RFC_SECRET, 30_000),
+    await totpCode(RFC_SECRET, 59_999),
+  );
+  assertEquals(totpStep(60_000), totpStep(30_000) + 1);
+});
+
+Deno.test("msUntilStepAfter waits out the remainder of the rejected step", () => {
+  // Code from step 1 (30_000-59_999) rejected at T=42s -> 18s left.
+  assertEquals(msUntilStepAfter(1, 42_000), 18_000);
+  // Rejected the instant the step opened -> a full step to wait.
+  assertEquals(msUntilStepAfter(1, 30_000), 30_000);
+  // One millisecond before it rolls.
+  assertEquals(msUntilStepAfter(1, 59_999), 1);
+});
+
+Deno.test("msUntilStepAfter does not wait when the step already rolled", () => {
+  // A request slow enough to outlive its own code needs no delay at all.
+  assertEquals(msUntilStepAfter(1, 60_000), 0);
+  assertEquals(msUntilStepAfter(1, 250_000), 0);
+});
+
+Deno.test("msUntilStepAfter honours a non-default step length", () => {
+  assertEquals(msUntilStepAfter(1, 90_000, 60), 30_000);
+});
+
+Deno.test("isTotpReplayRejection retries a rejected credential", () => {
+  // What a replayed code actually returns -- indistinguishable from a wrong
+  // password, which is why both are retried.
+  const body =
+    '{"message":"Invalid username or password","code":"AUTHENTICATION_FAILED_INVALID_CREDENTIALS"}';
+  assertEquals(isTotpReplayRejection(403, body), true);
+  assertEquals(isTotpReplayRejection(401, body), true);
+});
+
+Deno.test("isTotpReplayRejection does not retry a missing second factor", () => {
+  // A different code cannot fix "no second factor was accepted at all".
+  assertEquals(
+    isTotpReplayRejection(401, '{"code":"MFA_AUTH_REQUIRED"}'),
+    false,
+  );
+});
+
+Deno.test("isTotpReplayRejection ignores failures that are not auth", () => {
+  assertEquals(isTotpReplayRejection(500, "upstream exploded"), false);
+  assertEquals(isTotpReplayRejection(404, "no such endpoint"), false);
+  assertEquals(isTotpReplayRejection(200, ""), false);
+});
+
+Deno.test("isTotpReplayRejection does not retry into a rate limit", () => {
+  // Repeated rejected logins earn a 429 lockout. Retrying that only feeds it,
+  // and the lockout outlasts a 30s step anyway -- fail fast and name it.
+  assertEquals(
+    isTotpReplayRejection(
+      429,
+      '{"message":"You have reached the login attempt limit"}',
+    ),
+    false,
+  );
 });
 
 Deno.test("base32Decode handles padding, lowercase and whitespace", () => {

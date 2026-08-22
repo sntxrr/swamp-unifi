@@ -94,6 +94,61 @@ export async function totpCode(
   return (bin % 10 ** digits).toString().padStart(digits, "0");
 }
 
+/**
+ * The RFC 6238 time-step counter a code derived at `nowMs` belongs to.
+ *
+ * Exposed separately from {@link totpCode} because the retry below needs to
+ * reason about *which* step a rejected code came from, not what the code was.
+ *
+ * @param nowMs Time in milliseconds since the epoch.
+ * @param stepSeconds Time step; the RFC default is 30 seconds.
+ * @returns The step counter.
+ */
+export function totpStep(nowMs: number, stepSeconds = 30): number {
+  return Math.floor(nowMs / 1000 / stepSeconds);
+}
+
+/**
+ * How long to wait, from `nowMs`, before a derived code will differ from the
+ * one belonging to `usedStep`.
+ *
+ * Returns 0 when the step has already rolled — a request slow enough to
+ * outlive its own code needs no wait at all.
+ *
+ * @param usedStep Step counter of the code that was rejected.
+ * @param nowMs Current time in milliseconds since the epoch.
+ * @param stepSeconds Time step; the RFC default is 30 seconds.
+ * @returns Milliseconds to wait, never negative.
+ */
+export function msUntilStepAfter(
+  usedStep: number,
+  nowMs: number,
+  stepSeconds = 30,
+): number {
+  return Math.max(0, (usedStep + 1) * stepSeconds * 1000 - nowMs);
+}
+
+/**
+ * Whether a rejected login is worth one more try with a freshly derived code.
+ *
+ * A UniFi controller accepts each TOTP code exactly ONCE, and answers a replay
+ * with the same 403 `AUTHENTICATION_FAILED_INVALID_CREDENTIALS` it uses for a
+ * genuinely wrong password — so the response cannot distinguish the two and
+ * this deliberately retries both. The cost of being wrong is one step of delay
+ * on a run whose credentials were broken anyway.
+ *
+ * `MFA_AUTH_REQUIRED` is excluded: it means no second factor was accepted at
+ * all, which a different code does not fix.
+ *
+ * @param status HTTP status of the failed login.
+ * @param body Response body, already read.
+ * @returns True when a retry on the next step could plausibly succeed.
+ */
+export function isTotpReplayRejection(status: number, body: string): boolean {
+  if (status !== 401 && status !== 403) return false;
+  return !body.includes("MFA_AUTH_REQUIRED");
+}
+
 /* ------------------------------------------------------------------ *
  * IPv4 helpers — used to catch reservations that fall inside the DHCP
  * pool (the controller may refuse them) or collide with each other.
@@ -270,10 +325,16 @@ function redact(text: string, secrets: (string | undefined)[]): string {
  * with MFA enabled reject password-only logins with `MFA_AUTH_REQUIRED`.
  * Credentials are redacted from any error raised here.
  *
+ * When a TOTP login is refused, this waits for the code to roll and tries once
+ * more — the controller accepts each code exactly once, so back-to-back method
+ * calls in a single workflow would otherwise fail on the second. The retry adds
+ * at most one time step (30s) and only ever fires on an already-failed login.
+ *
  * @param args Connection and credential arguments.
  * @param nowMs Current time, injectable for deterministic TOTP in tests.
  * @returns An authenticated {@link UnifiClient}. Call `cleanup()` when done.
- * @throws If authentication fails, with a hint when MFA is the cause.
+ * @throws If authentication fails, with a hint when MFA is the cause or when a
+ *   retry on a fresh code was refused too.
  */
 export async function login(
   args: UnifiGlobalArgs,
@@ -281,26 +342,61 @@ export async function login(
 ): Promise<UnifiClient> {
   const baseUrl = `https://${args.host}`;
   const secrets = [args.password, args.totpSecret];
+  let retried = false;
 
-  const payload: Record<string, unknown> = {
-    username: args.username,
-    password: args.password,
-    rememberMe: true,
+  const attempt = async (atMs: number): Promise<Response> => {
+    const payload: Record<string, unknown> = {
+      username: args.username,
+      password: args.password,
+      rememberMe: true,
+    };
+    if (args.totpSecret) {
+      payload.token = await totpCode(args.totpSecret, atMs);
+    }
+    return await curl(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
   };
-  if (args.totpSecret) {
-    payload.token = await totpCode(args.totpSecret, nowMs);
+
+  let loginResp = await attempt(nowMs);
+  let failureBody = loginResp.ok ? "" : await loginResp.text();
+
+  // Each TOTP code is single-use on the controller. Two model methods in one
+  // workflow log in seconds apart, derive the SAME code, and the second is
+  // refused — which is what silently broke `unifi-drift-watch`: `drift`
+  // succeeded, `inventory` did not, and the 403 blamed the password. Rather
+  // than make every caller space its methods out by hand, wait for the code to
+  // roll and try once more.
+  //
+  // Real time on purpose: `nowMs` is injectable so the derivation is
+  // deterministic, but the *waiting* has to happen against the wall clock or
+  // the fresh code would not be fresh.
+  if (
+    !loginResp.ok && args.totpSecret &&
+    isTotpReplayRejection(loginResp.status, failureBody)
+  ) {
+    const waitMs = msUntilStepAfter(totpStep(nowMs), Date.now());
+    if (waitMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    loginResp = await attempt(Date.now());
+    failureBody = loginResp.ok ? "" : await loginResp.text();
+    retried = true;
   }
 
-  const loginResp = await curl(`${baseUrl}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(payload),
-  });
-
   if (!loginResp.ok) {
-    const text = redact(await loginResp.text(), secrets);
+    const text = redact(failureBody, secrets);
     const hint = text.includes("MFA_AUTH_REQUIRED")
       ? " — this account requires MFA; set `totpSecret`, or use a local-only admin account"
+      : loginResp.status === 429
+      ? " — the controller is rate-limiting logins, which is what it does after repeated rejected attempts; wait for the lockout to clear rather than retrying into it"
+      : retried
+      ? " — a second attempt on the following TOTP step was refused too, so this is a real credential failure and not a reused one-time code"
       : "";
     throw new Error(
       `UniFi login to ${args.host} failed (${loginResp.status})${hint}: ${text}`,
