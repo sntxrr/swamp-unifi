@@ -189,6 +189,21 @@ A local-only admin is the lower-risk option where you can create one — it
 scopes the credential to the controller and avoids storing a long-lived TOTP
 seed.
 
+### One code, one login
+
+The controller accepts each TOTP code exactly once. A workflow calling two
+methods back to back logs in twice within the same 30-second step, sends the
+same code both times, and the second login is refused with a 403 reading
+`Invalid username or password` — which names the wrong cause: the password is
+fine, the code was simply spent.
+
+`login()` handles this itself. A rejected TOTP login waits for the code to roll
+and retries once, so a multi-method workflow needs no hand-tuned spacing between
+its steps. The retry adds at most one 30-second step, only ever on a login that
+already failed, and only when `totpSecret` is set. If the fresh code is refused
+too, the error says so explicitly rather than leaving you to guess which of the
+two causes it was.
+
 ## Usage
 
 ```bash
