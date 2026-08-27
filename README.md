@@ -33,18 +33,21 @@ arguments, and setup are in the
 
 ## Quick start
 
-```bash
-# Store the controller password (and TOTP seed, if the account uses MFA)
-swamp vault create local_encryption udm
-swamp vault put udm UNIFI_PASSWORD          # paste the admin password
-swamp vault put udm UNIFI_TOTP_SECRET       # base32 seed; omit for a local-only admin
+An API key is the preferred credential: it performs no login exchange, so it
+neither negotiates MFA nor spends a single-use TOTP code, and two methods can
+run back to back without colliding. Password auth is still supported -- see
+[Authentication](./extensions/models/unifi-dhcp-reservation/README.md#authentication)
+if you cannot issue a key.
 
-# Register the controller (wire secrets from the vault)
+```bash
+# Store an API key, issued under Settings -> Control Plane -> Integrations
+swamp vault create local_encryption udm
+swamp vault put udm UNIFI_API_KEY           # paste the API key
+
+# Register the controller (wire the secret from the vault)
 swamp model create @sntxrr/unifi/dhcp_reservation home-udm \
   --global-arg 'host=192.0.2.1' \
-  --global-arg 'username=admin' \
-  --global-arg 'password=${{ vault.get(udm, UNIFI_PASSWORD) }}' \
-  --global-arg 'totpSecret=${{ vault.get(udm, UNIFI_TOTP_SECRET) }}'
+  --global-arg 'apiKey=${{ vault.get(udm, UNIFI_API_KEY) }}'
 
 # Read what the controller has (read-only)
 swamp model @sntxrr/unifi/dhcp_reservation method run sync home-udm
