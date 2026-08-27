@@ -177,19 +177,34 @@ instead, so there is no reservation to protect.
 
 | Account type | Configuration |
 | --- | --- |
+| **API key (preferred)** | `host`, `apiKey` |
 | Local-only admin (no MFA) | `host`, `username`, `password` |
 | UniFi SSO account with MFA | the above plus `totpSecret` |
 
-UniFi SSO accounts with MFA enabled reject password-only logins with
-`{"code":"MFA_AUTH_REQUIRED"}`. Supply the base32 `totpSecret` and the model
-derives an RFC 6238 code per run, so it works unattended. Both `password` and
-`totpSecret` are marked sensitive and are redacted from logs and error text.
+**Prefer the API key.** Issue one under Settings → Control Plane → Integrations.
+It is a plain bearer credential, so it performs no login exchange at all: no MFA
+negotiation, no one-time code, and nothing that can trip the login-attempt
+lockout. It reaches the same classic Network API and works for reads and writes
+alike.
 
-A local-only admin is the lower-risk option where you can create one — it
-scopes the credential to the controller and avoids storing a long-lived TOTP
-seed.
+That matters for more than tidiness. TOTP codes are **single-use**, and a
+workflow calling two methods back to back logs in twice within one 30-second
+step — so the second login replays the first one's code and is refused. The
+model retries on the next step to paper over this (see below), but an API key
+removes the problem rather than absorbing it, and is dramatically faster:
+three consecutive sessions take ~0.2s on an API key against tens of seconds
+when each one has to wait out a TOTP step.
 
-### One code, one login
+`apiKey`, `password` and `totpSecret` are all marked sensitive and redacted from
+logs and error text. The API key additionally travels in a curl `--config` file
+rather than as a command-line header, because process arguments are
+world-readable via `ps`.
+
+Supply `apiKey` **or** `username`+`password`, not both — a config carrying an
+API key never touches the password path. A config with neither, or with only
+half of the password pair, is rejected up front.
+
+### Password auth: one code, one login
 
 The controller accepts each TOTP code exactly once. A workflow calling two
 methods back to back logs in twice within the same 30-second step, sends the
