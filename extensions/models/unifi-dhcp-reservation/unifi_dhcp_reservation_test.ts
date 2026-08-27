@@ -1,5 +1,6 @@
 import {
   assertEquals,
+  assertRejects,
   assertStringIncludes,
   assertThrows,
 } from "jsr:@std/assert@1";
@@ -15,10 +16,12 @@ import {
   inPool,
   ipToInt,
   isTotpReplayRejection,
+  login,
   msUntilStepAfter,
   normalizeMac,
   totpCode,
   totpStep,
+  UnifiGlobalArgsSchema,
 } from "./unifi_dhcp_reservation.ts";
 
 /* ---------------- TOTP ---------------- */
@@ -56,6 +59,54 @@ Deno.test("totpCode is stable within a 30s step and rolls at the boundary", asyn
   const c = await totpCode(RFC_SECRET, 60_000);
   assertEquals(a, b);
   assertEquals(a === c, false);
+});
+
+/* ------- auth mode selection -------
+ *
+ * Two ways to prove identity, and the choice has consequences: an API key is a
+ * plain bearer credential, while a TOTP code is single-use and collides when
+ * two methods run back to back. Addresses below are RFC 5737 TEST-NET-1.
+ */
+
+Deno.test("global args accept an API key alone", () => {
+  const parsed = UnifiGlobalArgsSchema.parse({
+    host: "192.0.2.1",
+    apiKey: "not-a-real-key",
+  });
+  assertEquals(parsed.apiKey, "not-a-real-key");
+  assertEquals(parsed.username, undefined);
+  assertEquals(parsed.site, "default");
+});
+
+Deno.test("global args still accept the password shape", () => {
+  const parsed = UnifiGlobalArgsSchema.parse({
+    host: "192.0.2.1",
+    username: "admin",
+    password: "not-a-real-password",
+    totpSecret: "GEZDGNBVGY3TQOJQ",
+  });
+  assertEquals(parsed.username, "admin");
+  assertEquals(parsed.apiKey, undefined);
+});
+
+Deno.test("login refuses a config carrying no credentials at all", async () => {
+  // Throws before any network or filesystem work, so this needs no stubbing.
+  await assertRejects(
+    () => login({ host: "192.0.2.1", site: "default" } as never),
+    Error,
+    "incomplete",
+  );
+});
+
+Deno.test("login refuses a half-supplied password pair", async () => {
+  await assertRejects(
+    () =>
+      login(
+        { host: "192.0.2.1", site: "default", username: "admin" } as never,
+      ),
+    Error,
+    "incomplete",
+  );
 });
 
 /* ------- TOTP single-use retry -------

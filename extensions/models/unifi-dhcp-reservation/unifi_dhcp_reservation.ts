@@ -7,9 +7,14 @@
 // against a desired set without writing (`drift`), and reconciles them
 // (`apply`).
 //
+// Authentication is by API key (`X-API-KEY`) where one is supplied, and by
+// username/password otherwise. Prefer the key: it performs no login exchange,
+// so it neither negotiates MFA nor spends a single-use TOTP code, and two
+// methods running back to back in one workflow cannot collide.
+//
 // The UniFi API client below is derived from @mgreten/unifi's `_lib/unifi.ts`
-// (MIT, Copyright (c) 2026 Mat Greten) and extends it with TOTP/MFA support,
-// which the upstream login flow does not implement.
+// (MIT, Copyright (c) 2026 Mat Greten) and extends it with API-key auth and
+// TOTP/MFA support, neither of which the upstream login flow implements.
 
 import { z } from "npm:zod@4";
 
@@ -219,13 +224,24 @@ export function normalizeMac(mac: string): string {
  */
 export const UnifiGlobalArgsSchema = z.object({
   host: z.string().describe("UDM IP address or hostname, e.g. 192.0.2.1"),
-  username: z.string().describe("UniFi admin username"),
-  password: z.string().meta({ sensitive: true }).describe(
-    "UniFi admin password (use a vault reference)",
+  apiKey: z.string().meta({ sensitive: true }).optional().describe(
+    "API key issued under Settings -> Control Plane -> Integrations (use a " +
+      "vault reference). PREFERRED over password auth: an API key carries no " +
+      "one-time code, so several methods can run back to back in one " +
+      "workflow, and it is subject to neither the MFA exchange nor the " +
+      "login-attempt lockout. Supply this OR username+password, not both.",
+  ),
+  username: z.string().optional().describe(
+    "UniFi admin username. Password auth only -- omit when using `apiKey`.",
+  ),
+  password: z.string().meta({ sensitive: true }).optional().describe(
+    "UniFi admin password (use a vault reference). Password auth only.",
   ),
   totpSecret: z.string().meta({ sensitive: true }).optional().describe(
     "Base32 TOTP secret for MFA-enabled accounts (use a vault reference). " +
-      "Omit for local-only admin accounts, which bypass SSO MFA.",
+      "Omit for local-only admin accounts, which bypass SSO MFA. Password " +
+      "auth only, and see `apiKey` first -- TOTP codes are single-use, which " +
+      "makes any two logins in one run collide.",
   ),
   site: z.string().default("default").describe("UniFi site name"),
 });
@@ -253,9 +269,15 @@ async function curl(
     method?: string;
     headers?: Record<string, string>;
     body?: string;
+    // A curl --config file carrying headers too sensitive for argv. Process
+    // arguments are world-readable via `ps`, and an API key is a bearer
+    // credential -- the same reasoning that keeps the login body on stdin.
+    configFile?: string;
   } = {},
 ): Promise<Response> {
   const args = ["-sk", "--connect-timeout", "10", "-X", init.method || "GET"];
+
+  if (init.configFile) args.push("--config", init.configFile);
 
   if (init.headers) {
     for (const [key, value] of Object.entries(init.headers)) {
@@ -318,6 +340,104 @@ function redact(text: string, secrets: (string | undefined)[]): string {
 }
 
 /**
+ * Wrap a set of per-request headers into a {@link UnifiClient}.
+ *
+ * Shared by both authentication modes so the request and error handling stay
+ * identical between them — the only thing that differs is what proves who you
+ * are, and how it is carried.
+ *
+ * @param opts.headers Headers merged into every request.
+ * @param opts.csrfToken Sent on mutating verbs when set; API-key auth omits it.
+ * @param opts.configFile curl --config file for headers that must stay out of
+ *   argv. Its lifetime belongs to the caller's `cleanup`.
+ * @returns The client.
+ */
+function buildClient(opts: {
+  baseUrl: string;
+  site: string;
+  secrets: (string | undefined)[];
+  headers: Record<string, string>;
+  csrfToken?: string;
+  configFile?: string;
+  cleanup: () => Promise<void>;
+}): UnifiClient {
+  const { baseUrl, site, secrets, csrfToken, configFile } = opts;
+  return {
+    baseUrl,
+    site,
+    async request<T = unknown>(
+      path: string,
+      method = "GET",
+      body?: unknown,
+    ): Promise<T> {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...opts.headers,
+      };
+      if (csrfToken && method !== "GET" && method !== "HEAD") {
+        headers["X-CSRF-Token"] = csrfToken;
+      }
+
+      const resp = await curl(`${baseUrl}${path}`, {
+        method,
+        headers,
+        configFile,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+
+      if (!resp.ok) {
+        const text = redact(await resp.text(), secrets);
+        throw new Error(
+          `UniFi API ${method} ${path} failed (${resp.status}): ${text}`,
+        );
+      }
+
+      const text = await resp.text();
+      if (!text) return undefined as unknown as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        return text as unknown as T;
+      }
+    },
+    cleanup: opts.cleanup,
+  };
+}
+
+/**
+ * Build a session from an API key, with no login exchange at all.
+ *
+ * This is the preferred mode. An API key is a plain bearer credential: it
+ * carries no one-time code, so two methods running back to back in one
+ * workflow cannot collide the way TOTP logins do, and it never touches the
+ * login-attempt lockout because it never attempts a login.
+ *
+ * The key is written to a curl `--config` file rather than passed as `-H`,
+ * because process arguments are world-readable via `ps`.
+ *
+ * @param args Connection arguments, with `apiKey` set.
+ * @returns A {@link UnifiClient}. Call `cleanup()` to remove the header file.
+ */
+async function apiKeyClient(args: UnifiGlobalArgs): Promise<UnifiClient> {
+  const headerFile = await Deno.makeTempFile({ prefix: "unifi-dhcp-" });
+  await Deno.chmod(headerFile, 0o600).catch(() => {});
+  await Deno.writeTextFile(
+    headerFile,
+    `header = "X-API-KEY: ${args.apiKey}"\n`,
+  );
+  return buildClient({
+    baseUrl: `https://${args.host}`,
+    site: args.site,
+    secrets: [args.apiKey],
+    headers: {},
+    configFile: headerFile,
+    // Nothing server-side to tear down -- there is no session to log out of.
+    cleanup: () => Deno.remove(headerFile).catch(() => {}),
+  });
+}
+
+/**
  * Authenticate against a UniFi controller and return a session.
  *
  * Posts to `/api/auth/login`, capturing the session cookie and CSRF token. When
@@ -340,6 +460,17 @@ export async function login(
   args: UnifiGlobalArgs,
   nowMs: number = Date.now(),
 ): Promise<UnifiClient> {
+  // An API key short-circuits the whole exchange. Checked first so a config
+  // carrying both does not spend a TOTP code it did not need to.
+  if (args.apiKey) return await apiKeyClient(args);
+
+  if (!args.username || !args.password) {
+    throw new Error(
+      `UniFi credentials for ${args.host} are incomplete: set \`apiKey\`, or ` +
+        "both `username` and `password`",
+    );
+  }
+
   const baseUrl = `https://${args.host}`;
   const secrets = [args.password, args.totpSecret];
   let retried = false;
@@ -411,45 +542,13 @@ export async function login(
     .filter((c) => c.length > 0)
     .join("; ");
 
-  return {
+  return buildClient({
     baseUrl,
     site: args.site,
-    async request<T = unknown>(
-      path: string,
-      method = "GET",
-      body?: unknown,
-    ): Promise<T> {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Cookie: cookie,
-      };
-      if (method !== "GET" && method !== "HEAD") {
-        headers["X-CSRF-Token"] = csrfToken;
-      }
-
-      const resp = await curl(`${baseUrl}${path}`, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-
-      if (!resp.ok) {
-        const text = redact(await resp.text(), secrets);
-        throw new Error(
-          `UniFi API ${method} ${path} failed (${resp.status}): ${text}`,
-        );
-      }
-
-      const text = await resp.text();
-      if (!text) return undefined as unknown as T;
-      try {
-        return JSON.parse(text) as T;
-      } catch {
-        return text as unknown as T;
-      }
-    },
-    async cleanup() {
+    secrets,
+    headers: { Cookie: cookie },
+    csrfToken,
+    cleanup: async () => {
       try {
         await curl(`${baseUrl}/api/auth/logout`, {
           method: "POST",
@@ -459,7 +558,7 @@ export async function login(
         // best-effort
       }
     },
-  };
+  });
 }
 
 /**
