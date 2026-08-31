@@ -38,7 +38,8 @@
  *                            dark port with a large byte count is a run that
  *                            *used* to work. This is what located the riser in
  *                            the incident above, and it has no equivalent in any
- *                            outcome-based check.
+ *                            outcome-based check. Informational — like
+ *                            `erroringPorts`, it does NOT affect `inSync`.
  *
  * Error counters are cumulative since the device booted, so `erroringPorts`
  * reports a total, not a rate. A large total on a long-uptime switch may be old
@@ -48,6 +49,25 @@
  * the Prometheus series in `metrics` is for: `rate()` over the pushed gauge
  * separates an active fault from a healed one. `inSync` deliberately does not
  * gate on error totals for this reason.
+ *
+ * `darkPortsWithHistory` is the same argument with the sign flipped, and for a
+ * while it was the only check here that ignored it. Byte counters are also
+ * cumulative, so a single snapshot cannot tell a severed run from a laptop that
+ * went to sleep — both read "down, with history". The discriminator is whether
+ * the counter is still MOVING between observations: a docked laptop's climbs
+ * every time it wakes, a cut cable's is frozen forever. That needs two
+ * observations, and one `/stat/device` snapshot is one observation, so this
+ * model cannot make the distinction and must not pretend to. It reports the
+ * fact and emits `unifi_port_rx_bytes_total` for every port; the frozen-counter
+ * test belongs in the alerting rules, where time exists.
+ *
+ * Gating `inSync` on it instead produced 70 notifications in three days on the
+ * fabric this was written for, every one of them a sleeping laptop, while the
+ * signal it exists to serve — locating a dead run once something else has
+ * raised the alarm — was never diminished. `darkPortsWithHistory` is a
+ * DIAGNOSTIC, not a detector. The detectors are `wirelessUplinks`,
+ * `parentMismatches` and `offline`, which are exact booleans that no sleeping
+ * client can trip, and which catch the cascade above on the very next run.
  *
  * Authentication is by API key (`X-API-KEY`), not username/password. UniFi OS
  * rejects password logins on MFA-enabled SSO accounts with HTTP 499, and an API
@@ -151,7 +171,10 @@ const FabricSchema = z.object({
     rxBytes: z.number(),
     label: z.string().optional(),
   })).describe(
-    "Down, but has carried traffic before — a run that used to work.",
+    "Down, but has carried traffic before — a run that used to work. " +
+      "Cumulative totals, not rates — informational, does NOT affect inSync. " +
+      "A sleeping client is indistinguishable from a severed run in a single " +
+      "snapshot; alert on unifi_port_rx_bytes_total staying frozen instead.",
   ),
   offline: z.array(z.object({ name: z.string() })).describe(
     "Declared devices absent from /stat/device entirely.",
@@ -323,8 +346,16 @@ export function computeFabric(
       port: String(want.port),
       ...(want.label ? { label: want.label } : {}),
     };
-    metrics.push({ name: "unifi_port_up", value: up ? 1 : 0, labels });
-    if (speed !== undefined) {
+    // `unifi_port_up` is NOT emitted here — the all-ports loop below emits it
+    // for every port, declared or not, and emitting it twice would produce two
+    // series for the same port.
+    //
+    // Speed is emitted only while the port is UP. A down port reports
+    // `speed: 0`, and a rule of the shape `unifi_port_speed_mbps < 1000` reads
+    // that as a gigabit run negotiating zero rather than as a port with nothing
+    // plugged into it. Absent is the honest answer for a link that is not
+    // negotiated: there is no speed to assert on.
+    if (up && speed !== undefined) {
       metrics.push({ name: "unifi_port_speed_mbps", value: speed, labels });
     }
     if (up && want.minSpeed !== undefined && (speed ?? 0) < want.minSpeed) {
@@ -350,6 +381,28 @@ export function computeFabric(
     const txErrors = num(p.tx_errors) ?? 0;
     const rxBytes = num(p.rx_bytes) ?? 0;
     const up = p.up === true;
+
+    // Emitted for EVERY port, declared or not. The frozen-counter test that
+    // separates a severed run from a laptop that went to sleep needs two
+    // observations, which only the time-series database has — and it cannot
+    // compare a port whose series does not exist. Undeclared ports are
+    // precisely the ones nobody thought to describe, which is why they are the
+    // ones that most need a series. Declared ports carry their label through.
+    const portLabels: Record<string, string> = {
+      device: dev,
+      port: idxRaw,
+      ...(declared?.label ? { label: declared.label } : {}),
+    };
+    metrics.push({
+      name: "unifi_port_up",
+      value: up ? 1 : 0,
+      labels: portLabels,
+    });
+    metrics.push({
+      name: "unifi_port_rx_bytes_total",
+      value: rxBytes,
+      labels: portLabels,
+    });
 
     if (up && (rxErrors > 0 || txErrors > 0)) {
       erroringPorts.push({
@@ -385,14 +438,15 @@ export function computeFabric(
     }
   }
 
-  // Error totals are excluded from the verdict on purpose — see the module
-  // comment. Everything else is a structural assertion that is either true or
-  // false right now.
+  // Error totals and dark ports are both excluded from the verdict on purpose
+  // — see the module comment. Both are cumulative counters that a single
+  // snapshot cannot read as a rate, and both are diagnostics rather than
+  // detectors. What is left is structural assertions that are either true or
+  // false right now, and that no sleeping client can trip.
   const inSync = wirelessUplinks.length === 0 &&
     parentMismatches.length === 0 &&
     slowUplinks.length === 0 &&
     slowPorts.length === 0 &&
-    darkPortsWithHistory.length === 0 &&
     offline.length === 0;
 
   metrics.push({

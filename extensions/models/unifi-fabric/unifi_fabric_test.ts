@@ -172,7 +172,7 @@ Deno.test("error counters are reported but do NOT fail the verdict", () => {
   assertEquals(r.erroringPorts[0].rxErrors, 1277);
 });
 
-Deno.test("a down port that used to carry traffic is caught", () => {
+Deno.test("a down port that used to carry traffic is reported", () => {
   // The riser signature: every never-patched port reads zero bytes forever, so
   // a dark port with real history is a run that used to work.
   const r = computeFabric(
@@ -183,9 +183,85 @@ Deno.test("a down port that used to carry traffic is caught", () => {
     })],
     AT,
   );
-  assertEquals(r.inSync, false);
   assertEquals(r.darkPortsWithHistory.length, 1);
   assertEquals(r.darkPortsWithHistory[0].port, 11);
+});
+
+Deno.test("a dark port does NOT fail the verdict on its own", () => {
+  // The regression this guards: a laptop on a wired dock reads exactly like a
+  // severed run in one snapshot — down, with gigabytes behind it. Gating
+  // `inSync` on that turned every sleeping laptop into an hourly interrupt.
+  // The frozen-counter test that tells them apart needs two observations and
+  // therefore cannot live here; see unifi_port_rx_bytes_total.
+  const r = computeFabric(
+    [],
+    [],
+    [wired("sw-edge", "sw-core", {
+      ports: [port(7, { up: false, rx_bytes: 237_166_661_688 })],
+    })],
+    AT,
+  );
+  assertEquals(r.darkPortsWithHistory.length, 1);
+  assertEquals(r.inSync, true);
+  assertEquals(
+    r.metrics.find((x) => x.name === "unifi_fabric_in_sync")?.value,
+    1,
+  );
+});
+
+Deno.test("every port gets up and rx_bytes series, declared or not", () => {
+  // A rule cannot compare a series that does not exist, and the port that
+  // matters is usually the one nobody thought to declare.
+  const r = computeFabric(
+    [],
+    [{ device: "sw-core", port: 5, label: "uplink to gw" }],
+    [wired("sw-core", "gw", {
+      ports: [
+        port(5),
+        port(14, { up: false, rx_bytes: 237_166_661_688 }),
+      ],
+    })],
+    AT,
+  );
+
+  const up = r.metrics.filter((x) => x.name === "unifi_port_up");
+  assertEquals(up.length, 2);
+  assertEquals(up.find((x) => x.labels.port === "5")?.value, 1);
+  assertEquals(up.find((x) => x.labels.port === "14")?.value, 0);
+
+  // The declared port carries its label through; the undeclared one has none.
+  assertEquals(
+    up.find((x) => x.labels.port === "5")?.labels.label,
+    "uplink to gw",
+  );
+  assertEquals(up.find((x) => x.labels.port === "14")?.labels.label, undefined);
+
+  const bytes = r.metrics.filter((x) => x.name === "unifi_port_rx_bytes_total");
+  assertEquals(bytes.length, 2);
+  assertEquals(
+    bytes.find((x) => x.labels.port === "14")?.value,
+    237_166_661_688,
+  );
+});
+
+Deno.test("a down port emits no speed series", () => {
+  // A down port reports speed 0, and `unifi_port_speed_mbps < 1000` would read
+  // that as a gigabit run negotiating zero rather than as an empty socket.
+  const r = computeFabric(
+    [],
+    [{ device: "sw-core", port: 14, minSpeed: 1000 }],
+    [wired("sw-core", "gw", {
+      ports: [port(14, { up: false, speed: 0, rx_bytes: 237_166_661_688 })],
+    })],
+    AT,
+  );
+  assertEquals(
+    r.metrics.filter((x) => x.name === "unifi_port_speed_mbps"),
+    [],
+  );
+  // ...and it is not reported as slow either: a link that is not negotiated
+  // has no speed to assert on.
+  assertEquals(r.slowPorts, []);
 });
 
 Deno.test("a down port that was never used is ignored", () => {
@@ -197,6 +273,11 @@ Deno.test("a down port that was never used is ignored", () => {
   );
   assertEquals(r.inSync, true);
   assertEquals(r.darkPortsWithHistory, []);
+  // It still gets a series, so a rule can watch it start carrying traffic.
+  assertEquals(
+    r.metrics.find((x) => x.name === "unifi_port_rx_bytes_total")?.value,
+    0,
+  );
 });
 
 Deno.test("the dark-port threshold is honoured", () => {
