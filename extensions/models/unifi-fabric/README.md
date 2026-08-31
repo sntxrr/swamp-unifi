@@ -40,11 +40,21 @@ can actually see jitter.
 | `erroringPorts` | Non-zero rx/tx counters — the physical layer complaining. |
 | `darkPortsWithHistory` | Down, but has carried real traffic before. |
 
+The first three are **detectors** and gate `inSync`. They are exact booleans
+that no client device can trip, so they carry no false positives and are safe to
+wire straight to an interrupt.
+
+The last two are **diagnostics** and do not gate `inSync`. Both read cumulative
+counters, and a counter total is not a rate — see below.
+
 `darkPortsWithHistory` is the one with no equivalent in outcome-based
 monitoring. Every never-patched port reads zero bytes forever, so a dark port
 with a large byte count is a run that **used** to work. In the incident above it
 was what located the dead riser: one port, down, with 973 GB behind it, among a
 dozen dark ports that had never carried anything.
+
+Note *located*, not detected. Something else raised the alarm first. That is the
+role this check plays, and it is why it is not an interrupt.
 
 ## Counters are totals, not rates
 
@@ -57,8 +67,30 @@ So `erroringPorts` is **informational and does not affect `inSync`**. Treat a
 *rising* count as the signal: `rate()` over the pushed
 `unifi_port_rx_errors_total` gauge separates an active fault from a healed one.
 
-Likewise `darkPortsWithHistory` goes quiet after a device reboots, because the
-byte counters reset. It finds a fresh break, not an old one.
+`darkPortsWithHistory` is the same argument with the sign flipped, and it is
+**also informational**. Byte counters are cumulative too, so a single snapshot
+cannot tell a severed run from a laptop that went to sleep — both read "down,
+with history". The discriminator is whether the counter is still *moving*: a
+docked laptop's climbs every time it wakes, a cut cable's is frozen forever.
+That takes two observations, and one `/stat/device` snapshot is one observation.
+
+So the model reports the fact and emits `unifi_port_rx_bytes_total` for every
+port; the frozen-counter test belongs in the alerting rules, where time exists:
+
+```yaml
+- alert: UnifiPortDarkAndFrozen
+  expr: unifi_port_up == 0
+    and (unifi_port_rx_bytes_total - unifi_port_rx_bytes_total offset 6h) == 0
+  for: 6h
+```
+
+Gating `inSync` on it instead produced 70 notifications in three days on the
+fabric this was written for, every one of them a sleeping laptop — and an alert
+that restates an unchanged fact hourly is one that gets muted, which costs you
+the alerts that matter alongside it.
+
+Note also that `darkPortsWithHistory` goes quiet after a device reboots, because
+the byte counters reset. It finds a fresh break, not an old one.
 
 ## Usage
 
@@ -121,9 +153,19 @@ verdict, so a push step can forward it without reshaping the document:
 | `unifi_uplink_speed_mbps` | `device` |
 | `unifi_device_present` | `device` |
 | `unifi_port_up` | `device`, `port`, `label` |
+| `unifi_port_rx_bytes_total` | `device`, `port`, `label` |
 | `unifi_port_speed_mbps` | `device`, `port`, `label` |
 | `unifi_port_rx_errors_total` / `..._tx_errors_total` | `device`, `port` |
 | `unifi_fabric_in_sync` | — |
+
+`unifi_port_up` and `unifi_port_rx_bytes_total` are emitted for **every** port
+on every device, declared or not — the port that matters is usually the one
+nobody thought to declare, and a rule cannot compare a series that does not
+exist. `label` is present only where the port is declared.
+
+`unifi_port_speed_mbps` is emitted only while a port is **up**. A down port
+reports `speed: 0`, and a rule of the shape `unifi_port_speed_mbps < 1000` would
+read that as a gigabit run negotiating zero rather than as an empty socket.
 
 `unifi_uplink_is_wired` is emitted for **every** declared device, healthy ones
 included. A metric that only appears when something breaks cannot be alerted on
