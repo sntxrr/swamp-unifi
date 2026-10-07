@@ -142,6 +142,25 @@ Set `expectUplink: "wireless"` for a node that is *meant* to mesh, so deliberate
 mesh does not alarm. Its `expectParent` is still checked, so a mesh node that
 homes on the wrong peer is not silently accepted.
 
+### Declaring the topology on the model
+
+`links` and `ports` can also be global arguments. `check` uses the model's
+values for any field the call does not supply, so a scheduled run needs no
+input file:
+
+```yaml
+globalArguments:
+  host: 192.0.2.1
+  apiKey: ${{ vault.get('unifi', 'API_KEY') }}
+  links:
+    - { name: sw-core, expectUplink: wire, expectParent: gw, minUplinkSpeed: 1000 }
+  ports:
+    - { device: sw-core, port: 11, minSpeed: 1000, label: riser to sw-edge }
+```
+
+A `check` with no `links` on either side fails rather than reporting an empty
+declaration as in sync.
+
 ## Metrics
 
 `check` emits a flat, Prometheus-ready series in `metrics` alongside the

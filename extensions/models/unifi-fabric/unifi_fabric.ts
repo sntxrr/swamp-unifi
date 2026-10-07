@@ -79,20 +79,6 @@
 
 import { z } from "npm:zod@4";
 
-const GlobalArgsSchema = z.object({
-  host: z.string().describe(
-    "UniFi OS console IP or hostname, e.g. 192.0.2.1",
-  ),
-  apiKey: z.string().meta({ sensitive: true }).describe(
-    "API key issued under Settings → Control Plane → Integrations (use a " +
-      "vault reference). Preferred over password auth, which MFA-enabled SSO " +
-      "accounts reject with HTTP 499.",
-  ),
-  site: z.string().default("default").describe("UniFi site name"),
-});
-
-type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
-
 /** How one device is expected to be attached to the fabric. */
 const DesiredLinkSchema = z.object({
   name: z.string().describe(
@@ -127,6 +113,32 @@ const DesiredPortSchema = z.object({
     "What is on the port, for readable alerts, e.g. 'riser to sw-edge'.",
   ),
 });
+
+const GlobalArgsSchema = z.object({
+  host: z.string().describe(
+    "UniFi OS console IP or hostname, e.g. 192.0.2.1",
+  ),
+  apiKey: z.string().meta({ sensitive: true }).describe(
+    "API key issued under Settings → Control Plane → Integrations (use a " +
+      "vault reference). Preferred over password auth, which MFA-enabled SSO " +
+      "accounts reject with HTTP 499.",
+  ),
+  site: z.string().default("default").describe("UniFi site name"),
+  // The declared topology can live on the model rather than be passed to every
+  // `check` call. A scheduled `swamp serve` run has no `--input-file`, and a
+  // copy pasted into a trigger goes stale; the model definition is the one
+  // place that is both in git and visible to every runner.
+  links: z.array(DesiredLinkSchema).optional().describe(
+    "How each device should be attached. Used by `check` when the call " +
+      "supplies no `links` of its own.",
+  ),
+  ports: z.array(DesiredPortSchema).optional().describe(
+    "Ports whose speed is worth asserting. Used by `check` when the call " +
+      "supplies no `ports` of its own.",
+  ),
+});
+
+type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
 
 const FabricSchema = z.object({
   checkedAt: z.string(),
@@ -516,6 +528,26 @@ async function fetchDevices(g: GlobalArgs): Promise<Record<string, unknown>[]> {
   }
 }
 
+/**
+ * Pick the topology a `check` asserts against: the call's own, else the
+ * model's. Per field, so a call can override `ports` alone.
+ *
+ * No declared links is an error, never an empty pass. An empty declaration
+ * asserts nothing and would report the fabric in sync whatever its state.
+ */
+export function resolveTopology(
+  args: { links?: DesiredLink[]; ports?: DesiredPort[] },
+  globalArgs: Pick<GlobalArgs, "links" | "ports">,
+): { links: DesiredLink[]; ports: DesiredPort[] } {
+  const links = args.links ?? globalArgs.links;
+  if (!links || links.length === 0) {
+    throw new Error(
+      "no topology declared: pass `links` to check, or set `links` on the model",
+    );
+  }
+  return { links, ports: args.ports ?? globalArgs.ports ?? [] };
+}
+
 interface Context {
   globalArgs: GlobalArgs;
   writeResource: (
@@ -538,8 +570,23 @@ interface Context {
  */
 export const model = {
   type: "@sntxrr/unifi-fabric/topology",
-  version: "2026.08.20.1",
+  version: "2026.10.07.1",
   globalArguments: GlobalArgsSchema,
+
+  // 2026.10.07.1 adds the optional `links` / `ports` model arguments. Nothing
+  // existing changes shape, so every step is a pass-through.
+  upgrades: [
+    {
+      toVersion: "2026.08.31.1",
+      description: "Dark ports become a diagnostic; no argument change",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.07.1",
+      description: "Add optional links/ports model arguments",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     fabric: {
@@ -561,11 +608,13 @@ export const model = {
       description:
         "Compare a desired fabric topology against live UniFi devices. Reports wireless uplinks where wire was expected, wrong uplink parents, under-negotiated links, erroring ports and down-but-previously-used ports. Read-only — never writes to the controller.",
       arguments: z.object({
-        links: z.array(DesiredLinkSchema).describe(
-          "How each device should be attached to the fabric.",
+        links: z.array(DesiredLinkSchema).optional().describe(
+          "How each device should be attached to the fabric. Defaults to the " +
+            "model's `links`; one of the two is required.",
         ),
-        ports: z.array(DesiredPortSchema).default([]).describe(
-          "Switch ports whose speed is worth asserting.",
+        ports: z.array(DesiredPortSchema).optional().describe(
+          "Switch ports whose speed is worth asserting. Defaults to the " +
+            "model's `ports`, else none.",
         ),
         darkPortByteThreshold: z.number().default(1_000_000).describe(
           "Bytes a down port must have carried before it is reported as a run " +
@@ -575,21 +624,22 @@ export const model = {
       }),
       execute: async (
         args: {
-          links: DesiredLink[];
-          ports: DesiredPort[];
+          links?: DesiredLink[];
+          ports?: DesiredPort[];
           darkPortByteThreshold: number;
         },
         context: Context,
       ): Promise<{ dataHandles: unknown[] }> => {
+        const { links, ports } = resolveTopology(args, context.globalArgs);
         context.logger.info(
           "Checking fabric topology for {n} declared devices against {host}",
-          { n: args.links.length, host: context.globalArgs.host },
+          { n: links.length, host: context.globalArgs.host },
         );
 
         const rows = await fetchDevices(context.globalArgs);
         const result = computeFabric(
-          args.links,
-          args.ports,
+          links,
+          ports,
           rows,
           new Date().toISOString(),
           args.darkPortByteThreshold,
