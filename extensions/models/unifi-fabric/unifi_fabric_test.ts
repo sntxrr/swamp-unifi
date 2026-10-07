@@ -1,5 +1,10 @@
-import { assertEquals } from "jsr:@std/assert@1";
-import { computeFabric, normalizeMac, shortName } from "./unifi_fabric.ts";
+import { assertEquals, assertThrows } from "jsr:@std/assert@1";
+import {
+  computeFabric,
+  normalizeMac,
+  resolveTopology,
+  shortName,
+} from "./unifi_fabric.ts";
 
 /**
  * A healthy fabric is the only state a live run can reach without breaking
@@ -282,9 +287,14 @@ Deno.test("a down port that was never used is ignored", () => {
 
 Deno.test("the dark-port threshold is honoured", () => {
   const rows = [
-    wired("sw-core", "gw", { ports: [port(6, { up: false, rx_bytes: 5_000 })] }),
+    wired("sw-core", "gw", {
+      ports: [port(6, { up: false, rx_bytes: 5_000 })],
+    }),
   ];
-  assertEquals(computeFabric([], [], rows, AT, 1_000_000).darkPortsWithHistory, []);
+  assertEquals(
+    computeFabric([], [], rows, AT, 1_000_000).darkPortsWithHistory,
+    [],
+  );
   assertEquals(
     computeFabric([], [], rows, AT, 1_000).darkPortsWithHistory.length,
     1,
@@ -349,7 +359,12 @@ Deno.test("the real cascade is reported as three distinct facts", () => {
       { name: "sw-edge", expectUplink: "wire", expectParent: "sw-core" },
       { name: "ap-low", expectUplink: "wire", expectParent: "sw-edge" },
     ],
-    [{ device: "sw-core", port: 11, minSpeed: 1000, label: "riser to sw-edge" }],
+    [{
+      device: "sw-core",
+      port: 11,
+      minSpeed: 1000,
+      label: "riser to sw-edge",
+    }],
     [
       wired("sw-core", "gw", {
         ports: [port(11, { up: false, rx_bytes: 973_725_818_575 })],
@@ -425,4 +440,36 @@ Deno.test("an unresolvable mesh peer falls back to the raw MAC", () => {
     AT,
   );
   assertEquals(r.wirelessUplinks[0].parent, "02005e0053ff");
+});
+
+Deno.test("the model's topology is used when the call supplies none", () => {
+  const links = [{ name: "sw-core", expectUplink: "wire" as const }];
+  const ports = [{ device: "sw-core", port: 1, minSpeed: 1000 }];
+  assertEquals(resolveTopology({}, { links, ports }), { links, ports });
+});
+
+Deno.test("a call's own topology overrides the model's, per field", () => {
+  const modelLinks = [{ name: "sw-core", expectUplink: "wire" as const }];
+  const callLinks = [{ name: "ap-low", expectUplink: "wire" as const }];
+  const modelPorts = [{ device: "sw-core", port: 1 }];
+  const r = resolveTopology(
+    { links: callLinks },
+    { links: modelLinks, ports: modelPorts },
+  );
+  assertEquals(r.links, callLinks);
+  assertEquals(r.ports, modelPorts);
+});
+
+Deno.test("no declared links anywhere is an error, not an empty pass", () => {
+  assertThrows(() => resolveTopology({}, {}), Error, "no topology declared");
+  assertThrows(
+    () => resolveTopology({ links: [] }, {}),
+    Error,
+    "no topology declared",
+  );
+});
+
+Deno.test("ports default to none when neither side declares them", () => {
+  const links = [{ name: "sw-core", expectUplink: "wire" as const }];
+  assertEquals(resolveTopology({ links }, {}).ports, []);
 });
